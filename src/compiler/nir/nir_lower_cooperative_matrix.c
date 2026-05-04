@@ -10,13 +10,25 @@
 /*
  * Lower flexible size cooperative matrix operations down to operations at the supported granularity.
  */
+
+/*
+ * Subgroup scope matricies with flexible dimensions just get split into outer rows and columns.
+ * For Workgroup scope matricies there are inner and outer splits.
+ * Inner split is a shape based on the number of subgroups in a workgroup.
+ * If the WG matrix dimension exceeds the inner split then the
+ * outer split handles the workgroup pieces inside the complete matrix.
+ */
 struct split_box {
    unsigned outer_rows;
    unsigned outer_cols;
+   unsigned inner_rows;
+   unsigned inner_cols;
+   bool wg_split;
 };
 
 struct split_mat {
    struct split_box box;
+   struct glsl_cmat_description desc;
    nir_variable **split_vars;
 };
 
@@ -25,21 +37,37 @@ struct split_info {
    unsigned m_gran;
    unsigned n_gran;
    unsigned k_gran;
+   unsigned num_sg_mat_per_wg;
+   unsigned inner_box_rows;
+   unsigned inner_box_cols;
 };
 
-static unsigned get_num_splits_box(const struct split_box *box)
+static unsigned get_num_splits_box(const struct split_box *box, enum glsl_cmat_use use)
 {
-   return box->outer_rows * box->outer_cols;
+   unsigned num_split = box->outer_cols * box->outer_rows;
+   if (box->wg_split) {
+      /* for accumlator there should be no need to load/store other subgroups */
+      /* Split the matrix into parts that can be handled by a single
+       * subgroup.
+       * for A/B other subgroup will need access to the rows or columns
+       * so need to add defs for those.
+       */
+      if (use == GLSL_CMAT_USE_A)
+         num_split *= box->inner_cols;
+      else if (use == GLSL_CMAT_USE_B)
+         num_split *= box->inner_rows;
+   }
+   return num_split;
 }
 
 static unsigned get_num_splits(struct split_mat *split)
 {
-   return get_num_splits_box(&split->box);
+   return get_num_splits_box(&split->box, split->desc.use);
 }
 
-static unsigned split_alloc_vars(struct split_mat *split)
+static unsigned split_alloc_vars(struct split_mat *split, enum glsl_cmat_use use)
 {
-   unsigned num_split = get_num_splits_box(&split->box);
+   unsigned num_split = get_num_splits_box(&split->box, use);
    split->split_vars = ralloc_array(split, struct nir_variable *, num_split);
    return num_split;
 }
@@ -129,6 +157,16 @@ get_lower_sizes(struct glsl_cmat_description desc, unsigned m_gran,
    *split_cols_out = split_cols;
 }
 
+static unsigned
+largest_divisor_le(unsigned n, unsigned max_val)
+{
+   for (unsigned d = MIN2(n, max_val); d >= 1; d--) {
+      if (n % d == 0)
+         return d;
+   }
+   return 1;
+}
+
 static bool
 split_desc(struct glsl_cmat_description *desc, struct split_info *info,
            struct split_box *box)
@@ -136,6 +174,9 @@ split_desc(struct glsl_cmat_description *desc, struct split_info *info,
    unsigned split_rows = 0, split_cols = 0;
    box->outer_cols = 1;
    box->outer_rows = 1;
+   box->inner_rows = 1;
+   box->inner_cols = 1;
+   box->wg_split = desc->scope == SCOPE_WORKGROUP;
 
    get_lower_sizes(*desc, info->m_gran, info->n_gran, info->k_gran, &split_rows, &split_cols);
 
@@ -148,7 +189,17 @@ split_desc(struct glsl_cmat_description *desc, struct split_info *info,
       desc->cols = split_cols;
    }
 
-   if (box->outer_rows == 1 && box->outer_cols == 1)
+   /* for workgroups the shape has to be fixed for all matricies in a matmul */
+   if (box->wg_split) {
+      box->inner_rows = largest_divisor_le(box->outer_rows,
+                                           info->inner_box_rows);
+      box->inner_cols = largest_divisor_le(box->outer_cols,
+                                           info->inner_box_cols);
+      box->outer_rows = box->outer_rows / box->inner_rows;
+      box->outer_cols = box->outer_cols / box->inner_cols;
+
+   }
+   if (box->outer_rows == 1 && box->outer_cols == 1 && !box->wg_split)
       return false;
    return true;
 }
@@ -1045,7 +1096,9 @@ split_var(nir_shader *shader,
       return;
 
    split_mat->box = box;
-   unsigned num_split = split_alloc_vars(split_mat);
+   split_mat->desc = desc;
+   unsigned num_split = split_alloc_vars(split_mat, desc.use);
+
    for (unsigned i = 0; i < num_split; i++) {
       if (!nir_variable_is_global(var)) {
          split_mat->split_vars[i] = nir_local_variable_create(impl,
@@ -1068,9 +1121,15 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
    struct hash_table *split_mats = _mesa_pointer_hash_table_create(mem_ctx);
 
    bool progress = false;
+   unsigned num_sg_mat_per_wg = MAX2(1, shader->info.workgroup_size[0] / shader->info.min_subgroup_size);
+   unsigned inner_box_cols = MIN2(num_sg_mat_per_wg, 8);
+   unsigned inner_box_rows = num_sg_mat_per_wg / inner_box_cols;
 
    struct split_info split_info = {
       .split_mats = split_mats,
+      .num_sg_mat_per_wg = num_sg_mat_per_wg,
+      .inner_box_rows = inner_box_rows,
+      .inner_box_cols = inner_box_cols,
       .m_gran = args->m_gran,
       .n_gran = args->n_gran,
       .k_gran = args->k_gran,
