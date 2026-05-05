@@ -935,6 +935,7 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .cooperativeMatrixPerElementOperationsNV = true,
       .cooperativeMatrixTensorAddressing = true,
       .cooperativeMatrixBlockLoads = true,
+      .cooperativeMatrixWorkgroupScope = true,
 
       /* VK_KHR_shader_untyped_pointers */
       .shaderUntypedPointers = true,
@@ -1418,6 +1419,8 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
 
       /* VK_NV_cooperative_matrix2 */
       .cooperativeMatrixFlexibleDimensionsMaxDimension = 1024,
+      .cooperativeMatrixWorkgroupScopeMaxWorkgroupSize = 256,
+      .cooperativeMatrixWorkgroupScopeReservedSharedMemory = 4096,
    };
 
 #if DETECT_OS_LINUX
@@ -3153,6 +3156,39 @@ lvp_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
 {
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, out, pProperties, pPropertyCount);
    fill_array_sizes_structs(&out.base, fill_flexible_matrix_prop_nv);
+
+   vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p)
+   {
+      *p = (struct VkCooperativeMatrixFlexibleDimensionsPropertiesNV){
+         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+         .MGranularity = 8,
+         .NGranularity = 8,
+         .KGranularity = 8,
+         .AType = VK_COMPONENT_TYPE_UINT8_KHR,
+         .BType = VK_COMPONENT_TYPE_UINT8_KHR,
+         .CType = VK_COMPONENT_TYPE_UINT32_KHR,
+         .ResultType = VK_COMPONENT_TYPE_UINT32_KHR,
+         .saturatingAccumulation = false,
+         .scope = VK_SCOPE_WORKGROUP_KHR,
+         .workgroupInvocations = 256,
+      };
+   }
+   vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p)
+   {
+      *p = (struct VkCooperativeMatrixFlexibleDimensionsPropertiesNV){
+         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+         .MGranularity = 8,
+         .NGranularity = 8,
+         .KGranularity = 8,
+         .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+         .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+         .saturatingAccumulation = false,
+         .scope = VK_SCOPE_WORKGROUP_KHR,
+         .workgroupInvocations = 256,
+      };
+   }
    return vk_outarray_status(&out);
 }
 
@@ -3164,8 +3200,7 @@ lvp_GetPhysicalDeviceCooperativeMatrixProperties2EXT(VkPhysicalDevice physicalDe
 {
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixProperties2EXT, out, pProperties, pPropertyCount);
 
-   if (info->scope == VK_SCOPE_SUBGROUP_KHR &&
-       !(info->flags & VK_COOPERATIVE_MATRIX_SATURATING_ACCUMULATION_BIT_EXT))
+   if (!(info->flags & VK_COOPERATIVE_MATRIX_SATURATING_ACCUMULATION_BIT_EXT))
       fill_array_sizes_structs(&out.base, fill_matrix_prop_ext);
    return vk_outarray_status(&out);
 }
