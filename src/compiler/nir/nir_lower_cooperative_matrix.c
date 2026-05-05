@@ -989,6 +989,267 @@ split_cmat_reduce_row_col(nir_builder *b,
 }
 
 static void
+split_cmat_reduce_row_col_wg(nir_builder *b,
+                             nir_function_impl *impl,
+                             nir_cmat_call_instr *call,
+                             struct split_mat *src_split,
+                             struct split_mat *dst_split,
+                             const struct glsl_type *temp_type,
+                             nir_deref_instr **temp_derefs)
+{
+   nir_instr *instr = &call->instr;
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+   int src_splits = get_num_splits(src_split);
+   int inner_rows = src_split->box.inner_rows;
+   int inner_cols = src_split->box.inner_cols;
+   int inner_total = inner_rows * inner_cols;
+   int outer_rows = src_split->box.outer_rows;
+   int outer_cols = src_split->box.outer_cols;
+
+   /* Phase 1: Combine outer splits locally within each subgroup */
+   int num_groups;
+   nir_deref_instr **group_derefs;
+
+   if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+       (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) {
+      num_groups = 1;
+      for (int i = 1; i < src_splits; i++) {
+         b->cursor = nir_before_instr(instr);
+         call_reduce_finish(b, call, reduce, &temp_derefs[0]->def,
+                            &temp_derefs[0]->def,
+                            &temp_derefs[i]->def);
+      }
+      group_derefs = temp_derefs;
+   } else if (reduce & NIR_CMAT_REDUCE_ROW) {
+      num_groups = outer_rows;
+      group_derefs = ralloc_array(NULL, nir_deref_instr *, outer_rows);
+      for (int r = 0; r < outer_rows; r++) {
+         int base = r * outer_cols;
+         group_derefs[r] = temp_derefs[base];
+         for (int c = 1; c < outer_cols; c++) {
+            b->cursor = nir_before_instr(instr);
+            call_reduce_finish(b, call, reduce, &group_derefs[r]->def,
+                               &group_derefs[r]->def,
+                               &temp_derefs[base + c]->def);
+         }
+      }
+   } else {
+      num_groups = outer_cols;
+      group_derefs = ralloc_array(NULL, nir_deref_instr *, outer_cols);
+      for (int c = 0; c < outer_cols; c++) {
+         group_derefs[c] = temp_derefs[c];
+         for (int r = 1; r < outer_rows; r++) {
+            b->cursor = nir_before_instr(instr);
+            call_reduce_finish(b, call, reduce, &group_derefs[c]->def,
+                               &group_derefs[c]->def,
+                               &temp_derefs[c + r * outer_cols]->def);
+         }
+      }
+   }
+
+   /* Phase 2: Exchange across inner subgroups via shared memory */
+   int combine_count;
+   if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+       (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+      combine_count = inner_total;
+   else if (reduce & NIR_CMAT_REDUCE_ROW)
+      combine_count = inner_cols;
+   else
+      combine_count = inner_rows;
+
+   if (combine_count > 1) {
+      int matrix_elems = src_split->desc.rows * src_split->desc.cols;
+      int total_shared = num_groups * inner_total * matrix_elems;
+
+      const glsl_type *shared_arr_type =
+         get_shared_array_type(src_split->desc, total_shared);
+      nir_variable *shared_var =
+         nir_variable_create(b->shader, nir_var_mem_shared,
+                             shared_arr_type, "mat_reduce_tmp");
+      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+
+      nir_def *sg_valid;
+      nir_def *sgid_safe = get_safe_sgid_box(b, nir_load_subgroup_id(b),
+                                             &src_split->box, &sg_valid);
+      nir_def *inner_sg_row = nir_udiv_imm(b, sgid_safe, inner_cols);
+      nir_def *inner_sg_col = nir_umod_imm(b, sgid_safe, inner_cols);
+
+      for (int g = 0; g < num_groups; g++) {
+         nir_def *slot = nir_iadd_imm(b, sgid_safe, g * inner_total);
+         nir_def *elem_off = nir_imul_imm(b, slot, matrix_elems);
+
+         nir_deref_instr *ptr =
+            nir_build_deref_array(b, shared_deref, elem_off);
+         nir_if *store_if = nir_push_if(b, sg_valid);
+         nir_cmat_store(b, &ptr->def, &group_derefs[g]->def,
+                        nir_imm_int(b, src_split->desc.cols),
+                        .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+         nir_pop_if(b, store_if);
+      }
+
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+      nir_variable *load_tmp = nir_local_variable_create(impl, temp_type,
+                                                         "reduce_load_tmp");
+
+      for (int g = 0; g < num_groups; g++) {
+         for (int j = 0; j < combine_count; j++) {
+            nir_def *other_sg;
+            if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+                (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) {
+               other_sg = nir_imm_int(b, j);
+            } else if (reduce & NIR_CMAT_REDUCE_ROW) {
+               other_sg = nir_iadd(b,
+                                   nir_imul_imm(b, inner_sg_row, inner_cols),
+                                   nir_imm_int(b, j));
+            } else {
+               other_sg = nir_iadd(b,
+                                   nir_imul_imm(b, nir_imm_int(b, j), inner_cols),
+                                   inner_sg_col);
+            }
+
+            nir_def *slot = nir_iadd_imm(b, other_sg, g * inner_total);
+            nir_def *elem_off = nir_imul_imm(b, slot, matrix_elems);
+
+            nir_deref_instr *ptr =
+               nir_build_deref_array(b, shared_deref, elem_off);
+            nir_deref_instr *load_tmp_deref = nir_build_deref_var(b, load_tmp);
+            nir_cmat_load(b, &load_tmp_deref->def, &ptr->def,
+                          nir_imm_int(b, src_split->desc.cols),
+                          .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+
+            if (j == 0) {
+               nir_cmat_copy(b, &group_derefs[g]->def,
+                             &load_tmp_deref->def);
+            } else {
+               call_reduce_finish(b, call, reduce,
+                                  &group_derefs[g]->def,
+                                  &group_derefs[g]->def,
+                                  &load_tmp_deref->def);
+            }
+         }
+      }
+   }
+
+   /* Phase 2.5: Replicate results to all dest inner subgroups.
+    * For changedim, the dest may have more inner subgroups than the
+    * source. Only source-valid subgroups have correct reduce results.
+    * Use shared memory to distribute results to all dest subgroups.
+    */
+   int dst_inner_rows = dst_split ? dst_split->box.inner_rows : 1;
+   int dst_inner_cols = dst_split ? dst_split->box.inner_cols : 1;
+   int dst_inner_total = dst_inner_rows * dst_inner_cols;
+
+   if (dst_split && dst_split->box.wg_split &&
+       (dst_inner_total != inner_total ||
+        dst_inner_rows != inner_rows ||
+        dst_inner_cols != inner_cols)) {
+      int num_unique;
+      if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+          (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+         num_unique = 1;
+      else if (reduce & NIR_CMAT_REDUCE_ROW)
+         num_unique = inner_rows;
+      else
+         num_unique = inner_cols;
+
+      int rep_matrix_elems = src_split->desc.rows * src_split->desc.cols;
+      int rep_total = num_groups * num_unique * rep_matrix_elems;
+
+      const glsl_type *rep_arr_type =
+         get_shared_array_type(src_split->desc, rep_total);
+      nir_variable *rep_var =
+         nir_variable_create(b->shader, nir_var_mem_shared,
+                             rep_arr_type, "mat_reduce_replicate");
+      nir_deref_instr *rep_deref = nir_build_deref_var(b, rep_var);
+
+      nir_def *rep_sgid = nir_load_subgroup_id(b);
+      nir_def *rep_src_valid;
+      nir_def *rep_sgid_safe = get_safe_sgid_box(b, rep_sgid,
+                                                 &src_split->box, &rep_src_valid);
+
+      nir_def *store_key;
+      if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+          (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+         store_key = nir_imm_int(b, 0);
+      else if (reduce & NIR_CMAT_REDUCE_ROW)
+         store_key = nir_udiv_imm(b, rep_sgid_safe, inner_cols);
+      else
+         store_key = nir_umod_imm(b, rep_sgid_safe, inner_cols);
+
+      for (int g = 0; g < num_groups; g++) {
+         nir_def *slot = nir_iadd_imm(b, store_key, g * num_unique);
+         nir_def *elem_off = nir_imul_imm(b, slot, rep_matrix_elems);
+
+         nir_deref_instr *ptr =
+            nir_build_deref_array(b, rep_deref, elem_off);
+         nir_if *sif = nir_push_if(b, rep_src_valid);
+         nir_cmat_store(b, &ptr->def, &group_derefs[g]->def,
+                        nir_imm_int(b, src_split->desc.cols),
+                        .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+         nir_pop_if(b, sif);
+      }
+
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+      nir_def *dst_sgid_safe = get_safe_sgid_box(b, rep_sgid,
+                                                 &dst_split->box, NULL);
+
+      nir_def *load_key;
+      if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+          (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+         load_key = nir_imm_int(b, 0);
+      else if (reduce & NIR_CMAT_REDUCE_ROW)
+         load_key = nir_udiv_imm(b, dst_sgid_safe, dst_inner_cols);
+      else
+         load_key = nir_umod_imm(b, dst_sgid_safe, dst_inner_cols);
+
+      for (int g = 0; g < num_groups; g++) {
+         nir_def *slot = nir_iadd_imm(b, load_key, g * num_unique);
+         nir_def *elem_off = nir_imul_imm(b, slot, rep_matrix_elems);
+
+         nir_deref_instr *ptr =
+            nir_build_deref_array(b, rep_deref, elem_off);
+         nir_cmat_load(b, &group_derefs[g]->def, &ptr->def,
+                       nir_imm_int(b, src_split->desc.cols),
+                       .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+      }
+   }
+
+   /* Phase 3: Store results to dst_split */
+   if (dst_split) {
+      for (unsigned r = 0; r < dst_split->box.outer_rows; r++) {
+         for (unsigned c = 0; c < dst_split->box.outer_cols; c++) {
+            int didx = r * dst_split->box.outer_cols + c;
+            int gidx;
+            if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) ==
+                (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
+               gidx = 0;
+            else if (reduce & NIR_CMAT_REDUCE_ROW)
+               gidx = r % num_groups;
+            else
+               gidx = c % num_groups;
+
+            nir_deref_instr *deref = recreate_derefs(b, &call->params[0], dst_split->split_vars[didx]);
+            b->cursor = nir_before_instr(instr);
+            nir_cmat_copy(b, &deref->def, &group_derefs[gidx]->def);
+         }
+      }
+   } else {
+      nir_cmat_copy(b, call->params[0].ssa, &group_derefs[0]->def);
+   }
+
+   if (group_derefs != temp_derefs)
+      ralloc_free(group_derefs);
+}
+
+static void
 split_cmat_reduce_2x2(nir_builder *b,
                       nir_cmat_call_instr *call,
                       struct split_mat *src_split,
@@ -1019,6 +1280,129 @@ split_cmat_reduce_2x2(nir_builder *b,
    }
 }
 
+static void
+split_cmat_reduce_2x2_wg(nir_builder *b,
+                         nir_function_impl *impl,
+                         nir_cmat_call_instr *call,
+                         struct split_mat *src_split,
+                         struct split_mat *dst_split)
+{
+   nir_instr *instr = &call->instr;
+   int src_inner_rows = src_split->box.inner_rows;
+   int src_inner_cols = src_split->box.inner_cols;
+   int src_inner_total = src_inner_rows * src_inner_cols;
+   int src_outer_cols = src_split->box.outer_cols;
+   int src_splits = get_num_splits(src_split);
+   int matrix_elems = src_split->desc.rows * src_split->desc.cols;
+   int total_shared = src_splits * src_inner_total * matrix_elems;
+
+   const glsl_type *shared_arr_type =
+      get_shared_array_type(src_split->desc, total_shared);
+   nir_variable *shared_var =
+      nir_variable_create(b->shader, nir_var_mem_shared,
+                          shared_arr_type, "mat_reduce_2x2_tmp");
+   nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+
+   nir_def *sg_valid;
+   nir_def *sgid_safe = get_safe_sgid_box(b, nir_load_subgroup_id(b),
+                                          &src_split->box, &sg_valid);
+
+   /* Store all source splits to shared memory */
+   for (unsigned i = 0; i < src_splits; i++) {
+      nir_def *slot = nir_iadd_imm(b, sgid_safe, i * src_inner_total);
+      nir_def *elem_off = nir_imul_imm(b, slot, matrix_elems);
+
+      nir_deref_instr *ptr =
+         nir_build_deref_array(b, shared_deref, elem_off);
+      nir_deref_instr *src_deref = recreate_derefs(b, &call->params[1], src_split->split_vars[i]);
+      b->cursor = nir_before_instr(instr);
+      nir_if *store_if = nir_push_if(b, sg_valid);
+      nir_cmat_store(b, &ptr->def, &src_deref->def,
+                     nir_imm_int(b, src_split->desc.cols),
+                     .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+      nir_pop_if(b, store_if);
+   }
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+
+   int dst_inner_rows = dst_split ? dst_split->box.inner_rows : 1;
+   int dst_inner_cols = dst_split ? dst_split->box.inner_cols : 1;
+   int dst_outer_rows = dst_split ? dst_split->box.outer_rows : 1;
+   int dst_outer_cols = dst_split ? dst_split->box.outer_cols : 1;
+
+   nir_def *dst_sgid = nir_umod_imm(b, nir_load_subgroup_id(b),
+                                    dst_inner_rows * dst_inner_cols);
+   nir_def *my_sg_row = nir_udiv_imm(b, dst_sgid, dst_inner_cols);
+   nir_def *my_sg_col = nir_umod_imm(b, dst_sgid, dst_inner_cols);
+
+   const struct glsl_type *load_tmp_type = src_split->split_vars[0]->type;
+
+   for (int r = 0; r < dst_outer_rows; r++) {
+      for (int c = 0; c < dst_outer_cols; c++) {
+         int d_idx = c + r * dst_outer_cols;
+
+         /* Full grid position of this dst cell */
+         nir_def *full_dr = nir_iadd_imm(b, my_sg_row,
+                                         r * dst_inner_rows);
+         nir_def *full_dc = nir_iadd_imm(b, my_sg_col,
+                                         c * dst_inner_cols);
+
+         /* Map to 4 source positions in the full grid */
+         nir_def *sr = nir_imul_imm(b, full_dr, 2);
+         nir_def *sc = nir_imul_imm(b, full_dc, 2);
+
+         nir_def *sr_vals[2] = {sr, nir_iadd_imm(b, sr, 1)};
+         nir_def *sc_vals[2] = {sc, nir_iadd_imm(b, sc, 1)};
+
+         nir_deref_instr *src_tmp_derefs[4];
+         for (int k = 0; k < 4; k++) {
+            nir_def *src_r = sr_vals[k / 2];
+            nir_def *src_c = sc_vals[k % 2];
+
+            nir_def *s_outer_r =
+               nir_udiv_imm(b, src_r, src_inner_rows);
+            nir_def *s_sg_r =
+               nir_umod_imm(b, src_r, src_inner_rows);
+            nir_def *s_outer_c =
+               nir_udiv_imm(b, src_c, src_inner_cols);
+            nir_def *s_sg_c =
+               nir_umod_imm(b, src_c, src_inner_cols);
+
+            nir_def *s_outer_idx = nir_iadd(b,
+                                            nir_imul_imm(b, s_outer_r, src_outer_cols),
+                                            s_outer_c);
+            nir_def *s_sgid = nir_iadd(b,
+                                       nir_imul_imm(b, s_sg_r, src_inner_cols),
+                                       s_sg_c);
+            nir_def *slot = nir_iadd(b,
+                                     nir_imul_imm(b, s_outer_idx, src_inner_total),
+                                     s_sgid);
+            nir_def *elem_off = nir_imul_imm(b, slot, matrix_elems);
+
+            nir_deref_instr *ptr =
+               nir_build_deref_array(b, shared_deref, elem_off);
+
+            nir_variable *src_tmp = nir_local_variable_create(impl, load_tmp_type,
+                                                              "reduce_2x2_tmp");
+            src_tmp_derefs[k] = nir_build_deref_var(b, src_tmp);
+            nir_cmat_load(b, &src_tmp_derefs[k]->def, &ptr->def,
+                          nir_imm_int(b, src_split->desc.cols),
+                          .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+         }
+
+         nir_deref_instr *dst_deref = dst_split ?
+            recreate_derefs(b, &call->params[0], dst_split->split_vars[d_idx]) :
+            nir_src_as_deref(call->params[0]);
+         b->cursor = nir_before_instr(instr);
+         call_reduce_2x2(b, call, &dst_deref->def,
+                         &src_tmp_derefs[0]->def, &src_tmp_derefs[1]->def,
+                         &src_tmp_derefs[2]->def, &src_tmp_derefs[3]->def);
+      }
+   }
+}
 static bool
 split_cmat_call_reduce(nir_builder *b,
                        nir_function_impl *impl,
@@ -1040,7 +1424,7 @@ split_cmat_call_reduce(nir_builder *b,
       nir_deref_instr **temp_derefs = ralloc_array(NULL, nir_deref_instr *, src_splits);
 
       const struct glsl_type *temp_type = nir_cmat_call_get_var(call, 1)->type;
-      if (src_splits > 1)
+      if (src_split)
          temp_type = src_split->split_vars[0]->type;
       for (unsigned i = 0; i < src_splits; i++) {
          nir_variable *temp_var = nir_local_variable_create(impl, temp_type,
@@ -1057,7 +1441,12 @@ split_cmat_call_reduce(nir_builder *b,
          call_reduce(b, call, reduce, &temp_derefs[i]->def, &src_deref->def);
       }
 
-      split_cmat_reduce_row_col(b, call, src_split, dst_split, temp_derefs);
+      if (src_split && src_split->box.wg_split) {
+         split_cmat_reduce_row_col_wg(b, impl, call, src_split, dst_split, temp_type, temp_derefs);
+      } else {
+         split_cmat_reduce_row_col(b, call, src_split, dst_split, temp_derefs);
+      }
+
       ralloc_free(temp_derefs);
    } else if (reduce & NIR_CMAT_REDUCE_2X2) {
       assert(reduce == NIR_CMAT_REDUCE_2X2);
@@ -1065,7 +1454,11 @@ split_cmat_call_reduce(nir_builder *b,
       /* dst can have target dimensions, but src but be at least twice as large */
       assert (src_split);
 
-      split_cmat_reduce_2x2(b, call, src_split, dst_split);
+      if (src_split->box.wg_split) {
+         split_cmat_reduce_2x2_wg(b, impl, call, src_split, dst_split);
+      } else {
+         split_cmat_reduce_2x2(b, call, src_split, dst_split);
+      }
    }
 
    nir_instr_remove(instr);
