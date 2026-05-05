@@ -7698,6 +7698,9 @@ struct nir_calc_tensor_info {
    bool use_vec_decode;
    struct glsl_cmat_description desc;
    nir_tensor_clamp_mode clamp_mode;
+   uint16_t inner_rows;
+   uint16_t inner_cols;
+   bool wg;
    nir_if *clipped_if;
    nir_def *do_clamp;
    nir_function *decode_fnptr;

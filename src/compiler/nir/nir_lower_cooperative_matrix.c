@@ -167,6 +167,93 @@ largest_divisor_le(unsigned n, unsigned max_val)
    return 1;
 }
 
+/*
+ * Get a subgroup ID that is inside the matrix.
+ * This returns a bounded sgid and a nir bool if it's valid or not.
+ * All invalid end up in sgid 0.
+ */
+static nir_def *
+get_safe_sgid_box(nir_builder *b, nir_def *sgid,
+                  const struct split_box *box,
+                  nir_def **sg_valid_out)
+{
+   nir_def *sg_valid = nir_ilt_imm(b, sgid, box->inner_rows * box->inner_cols);
+   if (sg_valid_out)
+      *sg_valid_out = sg_valid;
+   return nir_bcsel(b, sg_valid, sgid, nir_imm_int(b, 0));
+}
+
+static void
+get_c_splits(const struct split_box *box, int split_index,
+             int *outer_row, int *outer_col)
+{
+   *outer_row = split_index / box->outer_cols;
+   *outer_col = split_index % box->outer_cols;
+}
+
+/*
+ * Calculate the row and column offsets
+ * depending on the box split.
+ * It decomposes the outer/inner boxes,
+ * then the outer row/col, and adds the
+ * inner index to the correct offset depending
+ * on the use.
+ */
+static void
+get_wg_split_offsets_imm(unsigned split_index,
+                         const struct split_box *box,
+                         enum glsl_cmat_use use,
+                         unsigned *row_offset_out, unsigned *col_offset_out)
+{
+   unsigned inner_count = (use == GLSL_CMAT_USE_A) ? box->inner_cols :
+                          (use == GLSL_CMAT_USE_B) ? box->inner_rows : 1;
+   int outer_idx = split_index / inner_count;
+   int inner_idx = split_index % inner_count;
+   int outer_row = outer_idx / box->outer_cols;
+   int outer_col = outer_idx % box->outer_cols;
+
+   *row_offset_out = outer_row * box->inner_rows;
+   *col_offset_out = outer_col * box->inner_cols;
+
+   if (use == GLSL_CMAT_USE_A)
+      *col_offset_out += inner_idx;
+   else if (use == GLSL_CMAT_USE_B)
+      *row_offset_out += inner_idx;
+}
+
+/*
+ * Take the split offsets and integrate into NIR calculations
+ * This takes the immediate offsets and calculates the NIR
+ * row/col offsets using the subgroup ID.
+ */
+static void
+get_wg_split_offsets(nir_builder *b, nir_def *sgid, unsigned split_index,
+                     const struct split_box *box,
+                     const struct glsl_cmat_description *desc,
+                     nir_def **row_offset_out, nir_def **col_offset_out)
+{
+   unsigned row_off_imm, col_off_imm;
+   get_wg_split_offsets_imm(split_index, box, desc->use,
+                               &row_off_imm, &col_off_imm);
+
+   bool has_sg_row = (desc->use != GLSL_CMAT_USE_B);
+   bool has_sg_col = (desc->use != GLSL_CMAT_USE_A);
+
+   if (has_sg_row) {
+      nir_def *sg_row = nir_umod_imm(b, nir_udiv_imm(b, sgid, box->inner_cols), box->inner_rows);
+      *row_offset_out = nir_imul_imm(b, nir_iadd_imm(b, sg_row, row_off_imm), desc->rows);
+   } else {
+      *row_offset_out = nir_imm_int(b, row_off_imm * desc->rows);
+   }
+
+   if (has_sg_col) {
+      nir_def *sg_col = nir_umod_imm(b, sgid, box->inner_cols);
+      *col_offset_out = nir_imul_imm(b, nir_iadd_imm(b, sg_col, col_off_imm), desc->cols);
+   } else {
+      *col_offset_out = nir_imm_int(b, col_off_imm * desc->cols);
+   }
+}
+
 static bool
 split_desc(struct glsl_cmat_description *desc, struct split_info *info,
            struct split_box *box)
@@ -215,7 +302,7 @@ split_cmat_construct(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    for (unsigned i = 0; i < splits; i++) {
@@ -240,7 +327,7 @@ split_cmat_copy(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src_split);
@@ -284,7 +371,7 @@ split_cmat_length(nir_builder *b,
       desc.cols = split_cols;
    }
 
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    b->cursor = nir_before_instr(instr);
@@ -307,7 +394,7 @@ split_cmat_insert(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src_split);
@@ -343,7 +430,7 @@ split_cmat_extract(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(src_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    b->cursor = nir_before_instr(instr);
@@ -436,7 +523,7 @@ split_cmat_bitcast(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src_split);
@@ -465,7 +552,7 @@ split_cmat_binary_op(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src0_split);
@@ -497,7 +584,7 @@ split_cmat_unary_op(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src_split);
@@ -526,7 +613,7 @@ split_cmat_scalar_op(nir_builder *b,
       return false;
 
    unsigned splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    assert(src_split);
@@ -837,36 +924,73 @@ split_cmat_load_store(nir_builder *b,
 
    struct split_mat *split = entry->data;
    unsigned splits = get_num_splits(split);
+   nir_def *base_sgid = NULL;
+   if (split->box.wg_split)
+      base_sgid = nir_load_subgroup_id(b);
+
    for (unsigned i = 0; i < splits; i++) {
       nir_deref_instr *new_deref = recreate_derefs(b, &intr->src[!is_load], split->split_vars[i]);
-      nir_deref_instr *ptr_deref;
+      nir_deref_instr *addr_deref = nir_src_as_deref(intr->src[is_load]);
+      unsigned dst_bit_size = addr_deref->def.bit_size;
       nir_def *stride = intr->src[2].ssa;
       nir_def *ptr = intr->src[is_load].ssa;
 
       b->cursor = nir_before_instr(instr);
-      if (i > 0) {
-         nir_deref_instr *addr_deref = nir_src_as_deref(intr->src[is_load]);
-         unsigned dst_bit_size = addr_deref->def.bit_size;
+      if (i > 0 || split->box.wg_split) {
          nir_def *this_index = nir_imm_zero(b, 1, dst_bit_size);
          unsigned deref_bytes_size = glsl_get_explicit_size(addr_deref->type, false);
          const struct glsl_type *scalar_type = glsl_get_scalar_type(glsl_get_cmat_element(var->type));
          unsigned elem_size = glsl_get_explicit_size(scalar_type, false);
          struct glsl_cmat_description desc = *glsl_get_cmat_description(split->split_vars[i]->type);
-         unsigned row_offset, col_offset;
 
-         row_offset = (i % split->box.outer_cols) * desc.cols;
-         col_offset = (i / split->box.outer_cols) * desc.rows;
-
-         if (layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR)
-            SWAP(row_offset, col_offset);
-
-         ptr_deref = nir_build_deref_cast(b, &addr_deref->def, addr_deref->modes, scalar_type, elem_size);
+         nir_deref_instr *ptr_deref = nir_build_deref_cast(b, &addr_deref->def, addr_deref->modes, scalar_type, elem_size);
+         nir_def *row_offset, *col_offset;
          stride = nir_udiv_imm(b, nir_imul_imm(b, stride, deref_bytes_size), elem_size);
 
-         if (col_offset)
-            this_index = nir_imm_intN_t(b, col_offset, dst_bit_size);
-         if (row_offset)
-            this_index = nir_iadd(b, this_index, nir_u2uN(b, nir_imul_imm(b, stride, row_offset), dst_bit_size));
+         if (split->box.wg_split) {
+            nir_def *sgid = base_sgid;
+
+            if (desc.use == GLSL_CMAT_USE_A) {
+               sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
+               if (inner_rows > 1) {
+                  nir_def *inner_sg_row = nir_umod_imm(b, sgid, inner_rows);
+                  row_offset = nir_imul_imm(b, inner_sg_row, desc.rows);
+               } else {
+                  row_offset = nir_imm_int(b, 0);
+               }
+               row_offset = nir_iadd_imm(b, row_offset, row_offset_out_imm * desc.rows);
+               int col_offset_val = col_offset_out_imm * desc.cols;
+               col_offset = nir_imm_int(b, col_offset_val);
+            } else if (desc.use == GLSL_CMAT_USE_B) {
+               sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
+               if (inner_cols > 1) {
+                  nir_def *inner_sg_col = nir_umod_imm(b, sgid, inner_cols);
+                  col_offset = nir_imul_imm(b, inner_sg_col, desc.cols);
+               } else {
+                  col_offset = nir_imm_int(b, 0);
+               }
+               col_offset = nir_iadd_imm(b, col_offset, col_offset_out_imm * desc.cols);
+               int row_offset_val = row_offset_out_imm * desc.rows;
+               row_offset = nir_imm_int(b, row_offset_val);
+            } else {
+               sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
+
+            get_wg_split_offsets(b, sgid, i, &split->box, &desc,
+                                 &row_offset, &col_offset);
+         } else {
+            int outer_row, outer_col;
+
+            get_c_splits(&split->box, i, &outer_row, &outer_col);
+
+            row_offset = nir_imm_int(b, outer_row * desc.rows);
+            col_offset = nir_imm_int(b, outer_col * desc.cols);
+         }
+         if (layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR)
+            SWAP(row_offset, col_offset);
+         this_index = nir_imul(b, stride, row_offset);
+         this_index = nir_iadd(b, this_index, col_offset);
+         this_index = nir_u2uN(b, this_index, dst_bit_size);
+
          ptr_deref = nir_build_deref_ptr_as_array(b, ptr_deref, this_index);
          ptr = &ptr_deref->def;
       }
@@ -894,7 +1018,7 @@ split_cmat_call_per_element_op(nir_builder *b,
 
    assert(src_split);
    int splits = get_num_splits(dst_split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    for (unsigned i = 0; i < splits; i++) {
@@ -940,7 +1064,7 @@ split_cmat_call_tensor_load_store(nir_builder *b,
       clip_split = find_call_split(info->split_mats, call, 4);
    }
    unsigned splits = get_num_splits(split);
-   if (splits <= 1)
+   if (splits < 1)
       return false;
 
    struct nir_cmat_tensor_load tensor_load = nir_cmat_call_tensor_load_info(call);
@@ -960,8 +1084,10 @@ split_cmat_call_tensor_load_store(nir_builder *b,
          split_tensor_load.view_permutations[p] = tensor_load.view_permutations[p];
 
       if (i > 0) {
-         split_tensor_load.split_row_index = i / split->box.outer_cols;
-         split_tensor_load.split_col_index = i % split->box.outer_cols;
+         int r, c;
+         get_c_splits(&split->box, i, &r, &c);
+         split_tensor_load.split_row_index = r;
+         split_tensor_load.split_col_index = c;
       }
 
       nir_cmat_call_instr *splitcall = nir_cmat_call_instr_create(b->shader, call->op, call->callee, call->decode_vec_fn);
@@ -1225,6 +1351,9 @@ nir_calc_tensor_derefs_init(nir_builder *b, struct nir_calc_tensor_info *info,
    }
 
    info->cols = orig_desc.cols;
+   info->wg = tensor_load.wg;
+   info->inner_rows = tensor_load.inner_rows;
+   info->inner_cols = tensor_load.inner_cols;
 
    info->decode_fnptr = call->callee;
    info->decode_vec_fnptr = call->decode_vec_fn;
@@ -1317,6 +1446,21 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
 {
    nir_def *idx;
    nir_def *span_coord[5];
+
+   if (info->wg) {
+      nir_def *sgid = nir_load_subgroup_id(b);
+
+      if (info->desc.use != GLSL_CMAT_USE_B &&
+          info->inner_rows > 1) {
+         nir_def *inner_sg_row = nir_udiv_imm(b, sgid, info->inner_cols);
+         row = nir_iadd(b, row, nir_imul_imm(b, inner_sg_row, info->desc.rows));
+      }
+
+      if (info->desc.use != GLSL_CMAT_USE_A) {
+         nir_def *inner_sg_col = nir_umod_imm(b, sgid, info->inner_cols);
+         col = nir_iadd(b, col, nir_imul_imm(b, inner_sg_col, info->desc.cols));
+      }
+   }
 
    col = nir_iadd_imm(b, col, info->col_imm_offset);
    row = nir_iadd_imm(b, row, info->row_imm_offset);
