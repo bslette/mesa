@@ -33,6 +33,7 @@ struct split_var_info {
 struct split_mat {
    struct split_box box;
    struct glsl_cmat_description desc;
+   struct glsl_cmat_description orig_desc;
    nir_variable **split_vars;
 };
 
@@ -52,6 +53,13 @@ static struct split_var_info *find_type_info(struct hash_table *split_var_info,
 {
    struct hash_entry *entry = _mesa_hash_table_search(split_var_info, type);
    return entry ? entry->data : NULL;
+}
+
+static const glsl_type *
+get_shared_array_type(const struct glsl_cmat_description desc, unsigned size)
+{
+   const struct glsl_type *scalar_type = glsl_simple_type(desc.element_type, 1, 1);
+   return glsl_array_type(scalar_type, size, 0);
 }
 
 static unsigned get_num_splits_box(const struct split_box *box, enum glsl_cmat_use use)
@@ -465,6 +473,7 @@ split_cmat_extract(nir_builder *b,
 
 static bool
 split_cmat_convert(nir_builder *b,
+                   nir_function_impl *impl,
                    nir_intrinsic_instr *intr,
                    struct split_info *info)
 {
@@ -478,21 +487,93 @@ split_cmat_convert(nir_builder *b,
    assert(dst_split && src_split);
 
    unsigned splits = get_num_splits(src_split);
-   for (unsigned i = 0; i < splits; i++) {
-      nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[i]);
-      nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
-      b->cursor = nir_before_instr(instr);
-      nir_cmat_convert(b, &dst_deref->def, &src_deref->def, .saturate = nir_intrinsic_saturate(intr),
-                       .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
-                       .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+   unsigned dst_splits = get_num_splits(dst_split);
+
+   struct glsl_cmat_description dst_desc = src_split->desc;
+   dst_desc.element_type = dst_split->desc.element_type;
+   struct glsl_cmat_description conv_desc = dst_desc;
+   dst_desc.use = dst_split->desc.use;
+
+   /* wg split will have to go via shared memory when changing use type,
+    * since the data distribution across subgroups changes.
+    * Same-use conversions can convert each split independently.
+    */
+   if (src_split->box.wg_split && src_split->desc.use != dst_split->desc.use) {
+      /* allocate shared memory for whole matrix */
+      struct glsl_cmat_description cmat_desc = dst_split->orig_desc;
+
+      const glsl_type *shared_arr_type =
+         get_shared_array_type(dst_split->desc, cmat_desc.cols * cmat_desc.rows);
+      nir_variable *shared_var = nir_variable_create(b->shader, nir_var_mem_shared,
+                                                     shared_arr_type, "mat_convert_tmp");
+      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+
+      nir_def *sg_valid;
+      nir_def *sgid = get_safe_sgid_box(b, nir_load_subgroup_id(b), &src_split->box,
+                                        &sg_valid);
+      for (unsigned i = 0; i < splits; i++) {
+         nir_variable *temp_var = nir_local_variable_create(impl, dst_split->split_vars[0]->type,
+                                                            "convert_split_tmp");
+         nir_deref_instr *temp_deref = nir_build_deref_var(b, temp_var);
+         nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_cmat_convert(b, &temp_deref->def, &src_deref->def,
+                          .saturate = nir_intrinsic_saturate(intr),
+                          .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                          .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+
+         nir_def *row_offset, *col_offset;
+         get_wg_split_offsets(b, sgid, i, &src_split->box, &conv_desc,
+                              &row_offset, &col_offset);
+         nir_def *this_index = nir_iadd(b, nir_imul(b, nir_imm_int(b, cmat_desc.cols), row_offset), col_offset);
+
+         nir_deref_instr *ptr = nir_build_deref_array(b, shared_deref, this_index);
+         nir_if *store_if = nir_push_if(b, sg_valid);
+         nir_cmat_store(b, &ptr->def, &temp_deref->def, nir_imm_int(b, cmat_desc.cols),
+                        .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+         nir_pop_if(b, store_if);
+      }
+
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+
+      /* Use a fresh sgid wrapped via modulo for the load phase, so excess
+       * subgroups load from the same position they will store to (via
+       * get_tensor_idx which also wraps sgid % inner_cols/rows).
+       */
+      nir_def *load_sgid = nir_umod_imm(b, nir_load_subgroup_id(b),
+                                        dst_split->box.inner_rows * dst_split->box.inner_cols);
+
+      for (unsigned i = 0; i < dst_splits; i++) {
+         nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_def *row_offset, *col_offset;
+         get_wg_split_offsets(b, load_sgid, i, &dst_split->box, &dst_desc,
+                              &row_offset, &col_offset);
+
+         nir_def *this_index = nir_iadd(b, nir_imul(b, nir_imm_int(b, cmat_desc.cols), row_offset), col_offset);
+         nir_deref_instr *ptr = nir_build_deref_array(b, shared_deref, this_index);
+
+         nir_cmat_load(b, &dst_deref->def, &ptr->def, nir_imm_int(b, cmat_desc.cols),
+                       .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+      }
+   } else {
+      for (unsigned i = 0; i < splits; i++) {
+         nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[i]);
+         nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_cmat_convert(b, &dst_deref->def, &src_deref->def, .saturate = nir_intrinsic_saturate(intr),
+                          .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                          .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+      }
    }
    nir_instr_remove(instr);
    return true;
 }
 
-
 static bool
 split_cmat_transpose(nir_builder *b,
+                     nir_function_impl *impl,
                      nir_intrinsic_instr *intr,
                      struct split_info *info)
 {
@@ -505,18 +586,77 @@ split_cmat_transpose(nir_builder *b,
 
    assert(dst_split && src_split);
 
+   unsigned src_splits = get_num_splits(src_split);
    unsigned dst_splits = get_num_splits(dst_split);
 
-   for (unsigned i = 0; i < dst_splits; i++) {
-      int r = i / dst_split->box.outer_rows;
-      int c = i % dst_split->box.outer_rows;
-      int out_idx = c * dst_split->box.outer_cols + r;
-      nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[out_idx]);
-      nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
-      b->cursor = nir_before_instr(instr);
-      nir_cmat_transpose(b, &dst_deref->def, &src_deref->def, .saturate = nir_intrinsic_saturate(intr),
-                         .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
-                         .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+   if (src_split->box.wg_split) {
+      struct glsl_cmat_description cmat_desc = dst_split->orig_desc;
+      const glsl_type *shared_arr_type =
+         get_shared_array_type(dst_split->desc, cmat_desc.cols * cmat_desc.rows);
+      nir_variable *shared_var = nir_variable_create(b->shader, nir_var_mem_shared,
+                                                     shared_arr_type, "mat_transpose_tmp");
+      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+
+      nir_def *sg_valid;
+      nir_def *sgid = get_safe_sgid_box(b, nir_load_subgroup_id(b),
+                                        &src_split->box,
+                                        &sg_valid);
+
+      for (unsigned i = 0; i < src_splits; i++) {
+         nir_variable *temp_var = nir_local_variable_create(impl, dst_split->split_vars[0]->type,
+                                                            "transpose_split_tmp");
+         nir_deref_instr *temp_deref = nir_build_deref_var(b, temp_var);
+         nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_cmat_transpose(b, &temp_deref->def, &src_deref->def, .saturate = nir_intrinsic_saturate(intr),
+                            .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                            .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+
+         nir_def *row_offset, *col_offset;
+         get_wg_split_offsets(b, sgid, i, &src_split->box, &src_split->desc,
+                              &row_offset, &col_offset);
+         SWAP(row_offset, col_offset);
+
+         nir_def *this_index = nir_iadd(b, nir_imul(b, nir_imm_int(b, cmat_desc.cols), row_offset), col_offset);
+         nir_deref_instr *ptr = nir_build_deref_array(b, shared_deref, this_index);
+
+         nir_if *store_if = nir_push_if(b, sg_valid);
+         nir_cmat_store(b, &ptr->def, &temp_deref->def, nir_imm_int(b, cmat_desc.cols),
+                        .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+         nir_pop_if(b, store_if);
+      }
+
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+
+      nir_def *load_sgid = nir_umod_imm(b, nir_load_subgroup_id(b),
+                                        dst_split->box.inner_rows * dst_split->box.inner_cols);
+
+      for (unsigned i = 0; i < dst_splits; i++) {
+         nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_def *row_offset, *col_offset;
+         get_wg_split_offsets(b, load_sgid, i, &dst_split->box, &dst_split->desc,
+                              &row_offset, &col_offset);
+
+         nir_def *this_index = nir_iadd(b, nir_imul(b, nir_imm_int(b, cmat_desc.cols), row_offset), col_offset);
+         nir_deref_instr *ptr = nir_build_deref_array(b, shared_deref, this_index);
+
+         nir_cmat_load(b, &dst_deref->def, &ptr->def, nir_imm_int(b, cmat_desc.cols),
+                       .matrix_layout = GLSL_MATRIX_LAYOUT_ROW_MAJOR);
+      }
+   } else {
+      for (unsigned i = 0; i < dst_splits; i++) {
+         int r, c;
+         get_c_splits(&dst_split->box, i, &r, &c);
+         int out_idx = c * dst_split->box.outer_rows + r;
+         nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[out_idx]);
+         nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
+         b->cursor = nir_before_instr(instr);
+         nir_cmat_transpose(b, &dst_deref->def, &src_deref->def, .saturate = nir_intrinsic_saturate(intr),
+                            .cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr),
+                            .fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr));
+      }
    }
    nir_instr_remove(instr);
    return true;
@@ -1214,10 +1354,10 @@ split_matrix_impl(nir_function_impl *impl, struct split_info *info)
                progress |= split_cmat_extract(&b, intr, info);
                break;
             case nir_intrinsic_cmat_convert:
-               progress |= split_cmat_convert(&b, intr, info);
+               progress |= split_cmat_convert(&b, impl, intr, info);
                break;
             case nir_intrinsic_cmat_transpose:
-               progress |= split_cmat_transpose(&b, intr, info);
+               progress |= split_cmat_transpose(&b, impl, intr, info);
                break;
             case nir_intrinsic_cmat_bitcast:
                progress |= split_cmat_bitcast(&b, intr, info);
@@ -1290,7 +1430,7 @@ split_var(nir_shader *shader,
    }
 
    struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
-
+   struct glsl_cmat_description orig_desc = *glsl_get_cmat_description(type);
    struct split_box box;
    if (!split_desc(&desc, info, &box))
        return;
@@ -1302,6 +1442,7 @@ split_var(nir_shader *shader,
       return;
 
    split_mat->box = box;
+   split_mat->orig_desc = orig_desc;
    split_mat->desc = desc;
    unsigned num_split = split_alloc_vars(split_mat, desc.use);
 
