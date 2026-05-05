@@ -1181,15 +1181,26 @@ split_cmat_call_per_element_op(nir_builder *b,
       return false;
 
    for (unsigned i = 0; i < splits; i++) {
-      int r = i / dst_split->box.outer_cols;
-      int c = i % dst_split->box.outer_cols;
       nir_deref_instr *dst_deref = recreate_derefs(b, &call->params[0], dst_split->split_vars[i]);
       nir_deref_instr *src_deref = recreate_derefs(b, &call->params[3], src_split->split_vars[i]);
       struct glsl_cmat_description cmat_desc = *glsl_get_cmat_description(src_split->split_vars[0]->type);
       nir_cmat_call_instr *new_call = nir_cmat_call_instr_create(b->shader, nir_cmat_call_op_per_element_op, call->callee, NULL);
       new_call->params[0] = nir_src_for_ssa(&dst_deref->def);
-      new_call->params[1] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.rows * r));
-      new_call->params[2] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.cols * c));
+
+      if (dst_split->box.wg_split) {
+         nir_def *sgid = nir_load_subgroup_id(b);
+         nir_def *row_offset, *col_offset;
+         get_wg_split_offsets(b, sgid, i, &src_split->box, &cmat_desc,
+                              &row_offset, &col_offset);
+
+         new_call->params[1] = nir_src_for_ssa(row_offset);
+         new_call->params[2] = nir_src_for_ssa(col_offset);
+      } else {
+         int r, c;
+         get_c_splits(&dst_split->box, i, &r, &c);
+         new_call->params[1] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.rows * r));
+         new_call->params[2] = nir_src_for_ssa(nir_imm_int(b, cmat_desc.cols * c));
+      }
       new_call->params[3] = nir_src_for_ssa(&src_deref->def);
 
       for (unsigned j = 4; j < call->num_params; j++) {
