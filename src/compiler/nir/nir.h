@@ -329,11 +329,14 @@ typedef enum {
  */
 struct nir_cmat_tensor_load {
    uint32_t tensor_view:1;
-   uint32_t split_row_index:15;
+   uint32_t split_row_index:11;
+   uint32_t inner_rows:4;
    uint32_t view_has_dims:1;
-   uint32_t split_col_index:15;
+   uint32_t split_col_index:11;
+   uint32_t inner_cols:4;
    uint8_t view_permutations[NIR_TENSOR_VIEW_MAX_PERMUTATIONS];
    uint8_t layout_clamp_mode; /* nir_tensor_clamp_mode */
+   bool wg;
 };
 
 #define nir_const_value_to_array(arr, c, components, m) \

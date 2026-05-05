@@ -26,6 +26,10 @@ struct split_box {
    bool wg_split;
 };
 
+struct split_var_info {
+   struct split_box c_box;
+};
+
 struct split_mat {
    struct split_box box;
    struct glsl_cmat_description desc;
@@ -33,6 +37,7 @@ struct split_mat {
 };
 
 struct split_info {
+   struct hash_table *split_var_info;
    struct hash_table *split_mats;
    unsigned m_gran;
    unsigned n_gran;
@@ -41,6 +46,13 @@ struct split_info {
    unsigned inner_box_rows;
    unsigned inner_box_cols;
 };
+
+static struct split_var_info *find_type_info(struct hash_table *split_var_info,
+                                             const glsl_type *type)
+{
+   struct hash_entry *entry = _mesa_hash_table_search(split_var_info, type);
+   return entry ? entry->data : NULL;
+}
 
 static unsigned get_num_splits_box(const struct split_box *box, enum glsl_cmat_use use)
 {
@@ -654,19 +666,22 @@ split_cmat_muladd(nir_builder *b,
       m_splits = result_split->box.outer_rows;
       n_splits = result_split->box.outer_cols;
 
-      assert(c_split->box.outer_rows == m_splits);
-      assert(c_split->box.outer_cols == n_splits);
-      if (a_split)
-         assert(a_split->box.outer_rows == m_splits);
+      if (!c_split->box.wg_split) {
+         assert(c_split->box.outer_rows == m_splits);
+         assert(c_split->box.outer_cols == n_splits);
+         if (a_split)
+            assert(a_split->box.outer_rows == m_splits);
 
-      if (b_split)
-         assert(b_split->box.outer_cols == n_splits);
+         if (b_split)
+            assert(b_split->box.outer_cols == n_splits);
+      }
    }
 
-   if (a_split && a_split->box.outer_cols > 1) {
+   if (a_split && (a_split->box.outer_cols > 1 || a_split->box.wg_split)) {
       assert(b_split);
-      assert(b_split->box.outer_rows == a_split->box.outer_cols);
-      k_splits = a_split->box.outer_cols;
+      if (!a_split->box.wg_split)
+         assert(b_split->box.outer_rows == a_split->box.outer_cols);
+      k_splits = a_split->box.wg_split ? a_split->box.inner_cols : a_split->box.outer_cols;
    }
 
    for (unsigned m = 0; m < m_splits; m++) {
@@ -676,8 +691,16 @@ split_cmat_muladd(nir_builder *b,
          nir_deref_instr *c_deref = c_split ? recreate_derefs(b, &intr->src[3], c_split->split_vars[idx]) : nir_src_as_deref(intr->src[3]);
 
          for (unsigned k = 0; k < k_splits; k++) {
-            unsigned a_idx = m * k_splits + k;
-            unsigned b_idx = k * n_splits + n;
+            unsigned a_idx = (a_split && a_split->box.wg_split) ? m * a_split->box.inner_cols + k : (m * k_splits + k);
+            unsigned b_idx;
+            if (b_split && b_split->box.wg_split) {
+               unsigned b_outer_row = k / b_split->box.inner_rows;
+               unsigned b_inner_row = k % b_split->box.inner_rows;
+               b_idx = (b_outer_row * b_split->box.outer_cols + n) *
+                  b_split->box.inner_rows + b_inner_row;
+            } else {
+               b_idx = k * n_splits + n;
+            }
             nir_deref_instr *a_deref = a_split ? recreate_derefs(b, &intr->src[1], a_split->split_vars[a_idx]) : nir_src_as_deref(intr->src[1]);
             nir_deref_instr *b_deref = b_split ? recreate_derefs(b, &intr->src[2], b_split->split_vars[b_idx]) : nir_src_as_deref(intr->src[2]);
             nir_deref_instr *k_dst_deref = k == k_splits - 1 ? dst_deref : c_deref;
@@ -925,6 +948,7 @@ split_cmat_load_store(nir_builder *b,
    struct split_mat *split = entry->data;
    unsigned splits = get_num_splits(split);
    nir_def *base_sgid = NULL;
+
    if (split->box.wg_split)
       base_sgid = nir_load_subgroup_id(b);
 
@@ -950,29 +974,12 @@ split_cmat_load_store(nir_builder *b,
          if (split->box.wg_split) {
             nir_def *sgid = base_sgid;
 
-            if (desc.use == GLSL_CMAT_USE_A) {
-               sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
-               if (inner_rows > 1) {
-                  nir_def *inner_sg_row = nir_umod_imm(b, sgid, inner_rows);
-                  row_offset = nir_imul_imm(b, inner_sg_row, desc.rows);
-               } else {
-                  row_offset = nir_imm_int(b, 0);
-               }
-               row_offset = nir_iadd_imm(b, row_offset, row_offset_out_imm * desc.rows);
-               int col_offset_val = col_offset_out_imm * desc.cols;
-               col_offset = nir_imm_int(b, col_offset_val);
-            } else if (desc.use == GLSL_CMAT_USE_B) {
-               sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
-               if (inner_cols > 1) {
-                  nir_def *inner_sg_col = nir_umod_imm(b, sgid, inner_cols);
-                  col_offset = nir_imul_imm(b, inner_sg_col, desc.cols);
-               } else {
-                  col_offset = nir_imm_int(b, 0);
-               }
-               col_offset = nir_iadd_imm(b, col_offset, col_offset_out_imm * desc.cols);
-               int row_offset_val = row_offset_out_imm * desc.rows;
-               row_offset = nir_imm_int(b, row_offset_val);
-            } else {
+            struct split_var_info *c_info = find_type_info(info->split_var_info, var->type);
+            if (desc.use == GLSL_CMAT_USE_A && c_info)
+               sgid = nir_udiv_imm(b, sgid, c_info->c_box.inner_cols);
+            else if (desc.use == GLSL_CMAT_USE_B && c_info)
+               sgid = nir_umod_imm(b, sgid, c_info->c_box.inner_cols);
+            else
                sgid = get_safe_sgid_box(b, sgid, &split->box, NULL);
 
             get_wg_split_offsets(b, sgid, i, &split->box, &desc,
@@ -997,9 +1004,21 @@ split_cmat_load_store(nir_builder *b,
       if (is_load)
          nir_cmat_load(b, &new_deref->def, ptr, stride,
                        .matrix_layout = layout);
-      else
+      else {
+         nir_if *store_if_inner = NULL;
+         if (split->box.wg_split) {
+            int limit = split->box.inner_rows * split->box.inner_cols;
+            if (split->desc.use == GLSL_CMAT_USE_A)
+               limit = split->box.inner_rows;
+            else if (split->desc.use == GLSL_CMAT_USE_B)
+               limit = split->box.inner_cols;
+            store_if_inner = nir_push_if(b, nir_ilt_imm(b, base_sgid, limit));
+         }
          nir_cmat_store(b, ptr, &new_deref->def, stride,
                         .matrix_layout = layout);
+         if (split->box.wg_split)
+            nir_pop_if(b, store_if_inner);
+      }
    }
    nir_instr_remove(instr);
    return true;
@@ -1082,8 +1101,28 @@ split_cmat_call_tensor_load_store(nir_builder *b,
       split_tensor_load.layout_clamp_mode = tensor_load.layout_clamp_mode;
       for (unsigned p = 0; p < NIR_TENSOR_VIEW_MAX_PERMUTATIONS; p++)
          split_tensor_load.view_permutations[p] = tensor_load.view_permutations[p];
+      split_tensor_load.wg = tensor_load.wg || split->box.wg_split;
 
-      if (i > 0) {
+      if (split->box.wg_split) {
+         unsigned row_offset, col_offset;
+         get_wg_split_offsets_imm(i, &split->box, split->desc.use,
+                                  &row_offset, &col_offset);
+         if (split->desc.use == GLSL_CMAT_USE_A) {
+            split_tensor_load.inner_rows = split->box.inner_rows;
+            nir_deref_instr *a_deref = nir_src_as_deref(call->params[!is_load]);
+            struct split_var_info *c_info = a_deref ?
+               find_type_info(info->split_var_info, glsl_without_array(a_deref->type)) : NULL;
+            split_tensor_load.inner_cols = c_info ? c_info->c_box.inner_cols : 1;
+         } else if (split->desc.use == GLSL_CMAT_USE_B) {
+            split_tensor_load.inner_rows = 1;
+            split_tensor_load.inner_cols = split->box.inner_cols;
+         } else {
+            split_tensor_load.inner_rows = split->box.inner_rows;
+            split_tensor_load.inner_cols = split->box.inner_cols;
+         }
+         split_tensor_load.split_row_index = row_offset;
+         split_tensor_load.split_col_index = col_offset;
+      } else if (i > 0) {
          int r, c;
          get_c_splits(&split->box, i, &r, &c);
          split_tensor_load.split_row_index = r;
@@ -1104,6 +1143,47 @@ split_cmat_call_tensor_load_store(nir_builder *b,
 
    nir_instr_remove(instr);
    return true;
+}
+
+
+static bool
+split_matrix_impl_phase1(nir_function_impl *impl, struct split_info *info)
+{
+   bool progress = false;
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_cmat_muladd: {
+               const glsl_type *c_var_type = nir_intrinsic_get_var(intr, 3)->type;
+               const glsl_type *b_var_type = nir_intrinsic_get_var(intr, 2)->type;
+               const glsl_type *a_var_type = nir_intrinsic_get_var(intr, 1)->type;
+
+               struct glsl_cmat_description c_desc = *glsl_get_cmat_description(glsl_without_array(c_var_type));
+               struct glsl_cmat_description c_desc2 = *glsl_get_cmat_description(glsl_without_array(c_var_type));
+               struct split_var_info *split_info_a = rzalloc(info->split_var_info, struct split_var_info);
+               struct split_var_info *split_info_b = rzalloc(info->split_var_info, struct split_var_info);
+               split_desc(&c_desc, info, &split_info_a->c_box);
+               split_desc(&c_desc2, info, &split_info_b->c_box);
+
+               _mesa_hash_table_insert(info->split_var_info, b_var_type, split_info_b);
+               _mesa_hash_table_insert(info->split_var_info, a_var_type, split_info_a);
+               progress = true;
+               break;
+            }
+            default:
+               break;
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
+   }
+   return progress;
 }
 
 static bool
@@ -1245,6 +1325,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
 {
    void *mem_ctx = ralloc_context(NULL);
    struct hash_table *split_mats = _mesa_pointer_hash_table_create(mem_ctx);
+   struct hash_table *split_var_info = _mesa_pointer_hash_table_create(mem_ctx);
 
    bool progress = false;
    unsigned num_sg_mat_per_wg = MAX2(1, shader->info.workgroup_size[0] / shader->info.min_subgroup_size);
@@ -1252,6 +1333,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
    unsigned inner_box_rows = num_sg_mat_per_wg / inner_box_cols;
 
    struct split_info split_info = {
+      .split_var_info = split_var_info,
       .split_mats = split_mats,
       .num_sg_mat_per_wg = num_sg_mat_per_wg,
       .inner_box_rows = inner_box_rows,
@@ -1261,6 +1343,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
       .k_gran = args->k_gran,
    };
 
+   progress = split_matrix_impl_phase1(impl, &split_info);
    nir_foreach_variable_in_shader(var, shader) {
       split_var(shader, NULL, &split_info, var);
    }
@@ -1270,6 +1353,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
 
    progress = split_matrix_impl(impl, &split_info);
    _mesa_hash_table_destroy(split_mats, NULL);
+   _mesa_hash_table_destroy(split_var_info, NULL);
    ralloc_free(mem_ctx);
    return progress;
 }
