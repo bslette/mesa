@@ -1593,6 +1593,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .cooperativeMatrixPerElementOperationsNV = true,
       .cooperativeMatrixTensorAddressing = true,
       .cooperativeMatrixBlockLoads = true,
+      .cooperativeMatrixWorkgroupScope = true,
 
       /* VK_NV_cooperative_matrix_decode_vector */
       .cooperativeMatrixDecodeVector = true,
@@ -2378,6 +2379,8 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
 
       /* VK_NV_cooperative_matrix2 */
       .cooperativeMatrixFlexibleDimensionsMaxDimension = 1024,
+      .cooperativeMatrixWorkgroupScopeMaxWorkgroupSize = 512,
+      .cooperativeMatrixWorkgroupScopeReservedSharedMemory = 4096,
 
       /* VK_KHR_maintenance10 */
       .rgba4OpaqueBlackSwizzled = true,
@@ -3684,6 +3687,38 @@ fill_flexible_matrix_prop_nv(struct __vk_outarray *base, struct matrix_prop *pro
          .saturatingAccumulation = prop->saturate,
          .scope = VK_SCOPE_SUBGROUP_KHR};
    }
+
+   vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, out, p)
+   {
+      *p = (struct VkCooperativeMatrixFlexibleDimensionsPropertiesNV){
+         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+         .MGranularity = 16,
+         .NGranularity = 16,
+         .KGranularity = 16,
+         .AType = prop->a_type,
+         .BType = prop->b_type,
+         .CType = prop->c_type,
+         .ResultType = prop->r_type,
+         .saturatingAccumulation = prop->saturate,
+         .scope = VK_SCOPE_WORKGROUP_KHR,
+         .workgroupInvocations = 512};
+   }
+
+   vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, out, p)
+   {
+      *p = (struct VkCooperativeMatrixFlexibleDimensionsPropertiesNV){
+         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+         .MGranularity = 16,
+         .NGranularity = 16,
+         .KGranularity = 16,
+         .AType = prop->a_type,
+         .BType = prop->b_type,
+         .CType = prop->c_type,
+         .ResultType = prop->r_type,
+         .saturatingAccumulation = prop->saturate,
+         .scope = VK_SCOPE_WORKGROUP_KHR,
+         .workgroupInvocations = 256};
+   }
 }
 
 static void
@@ -3761,8 +3796,15 @@ radv_GetPhysicalDeviceCooperativeMatrixProperties2EXT(VkPhysicalDevice physicalD
    VK_FROM_HANDLE(radv_physical_device, pdev, physicalDevice);
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixProperties2EXT, out, pProperties, pPropertyCount);
    bool saturate_flag = !!(info->flags & VK_COOPERATIVE_MATRIX_SATURATING_ACCUMULATION_BIT_EXT);
-   if (info->scope == VK_SCOPE_SUBGROUP_KHR)
-      fill_array_sizes_structs(pdev, &out.base, fill_matrix_prop2_ext, (void *)&saturate_flag);
+
+   if (info->scope == VK_SCOPE_WORKGROUP_KHR)
+      if (info->invocations != 0 &&
+          info->invocations != 256 &&
+          info->invocations != 512)
+         goto out;
+
+   fill_array_sizes_structs(pdev, &out.base, fill_matrix_prop2_ext, (void *)&saturate_flag);
+out:
    return vk_outarray_status(&out);
 }
 
