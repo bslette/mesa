@@ -725,6 +725,18 @@ lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
          deref = nir_build_deref_cast(b, def, nir_var_mem_global, deref->type, glsl_base_type_bit_size(desc.element_type) / 8);
       }
    }
+
+   nir_if *store_sg_guard = NULL;
+   nir_if *store_lane_guard = NULL;
+   if (!is_load) {
+      if (info.wg) {
+         int sg_limit = info.inner_rows * info.inner_cols;
+         store_sg_guard = nir_push_if(b, nir_ilt_imm(b, nir_load_subgroup_id(b), sg_limit));
+      }
+      unsigned lane_bound = (info.desc.use == GLSL_CMAT_USE_B) ? info.desc.rows : info.desc.cols;
+      store_lane_guard = nir_push_if(b, nir_ult_imm(b, local_idx, lane_bound));
+   }
+
    for (unsigned i = 0; i < CMAT_LEN; ++i) {
       nir_deref_instr *iter_deref = deref;
       nir_def *col_offset = local_idx;
@@ -761,6 +773,11 @@ lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
       }
 
    }
+
+   if (store_lane_guard)
+      nir_pop_if(b, store_lane_guard);
+   if (store_sg_guard)
+      nir_pop_if(b, store_sg_guard);
 
    if (is_load) {
       nir_def *mat = nir_vec(b, vars, CMAT_LEN);
