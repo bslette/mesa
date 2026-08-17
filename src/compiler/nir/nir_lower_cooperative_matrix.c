@@ -877,8 +877,29 @@ split_cmat_get_coordinate(nir_builder *b,
    adds[1] = nir_umod_imm(b, split_idx, box.outer_cols);
    nir_def *def = nir_cmat_get_coordinate(b, rem_def, .cmat_desc = desc);
 
-   adds[0] = nir_imul_imm(b, adds[0], desc.rows);
-   adds[1] = nir_imul_imm(b, adds[1], desc.cols);
+   if (box.wg_split) {
+      nir_def *sgid = nir_load_subgroup_id(b);
+      nir_def *inner_sg_row = nir_imm_int(b, 0);
+      nir_def *inner_sg_col = nir_imm_int(b, 0);
+
+      if (desc.use != GLSL_CMAT_USE_B &&
+          box.inner_rows > 1)
+         inner_sg_row = nir_umod_imm(b, nir_udiv_imm(b, sgid, box.inner_cols), box.inner_rows);
+
+      if (desc.use != GLSL_CMAT_USE_A)
+         inner_sg_col = nir_umod_imm(b, sgid, box.inner_cols);
+
+      adds[0] = nir_imul_imm(b,
+         nir_iadd(b, nir_imul_imm(b, adds[0], box.inner_cols), inner_sg_row),
+         desc.rows);
+      adds[1] = nir_imul_imm(b,
+         nir_iadd(b, nir_imul_imm(b, adds[1], box.inner_cols), inner_sg_col),
+         desc.cols);
+   } else {
+      adds[0] = nir_imul_imm(b, adds[0], desc.rows);
+      adds[1] = nir_imul_imm(b, adds[1], desc.cols);
+   }
+
    nir_def *add_vec = nir_vec(b, adds, 2);
    def = nir_iadd(b, def, add_vec);
    nir_def_replace(&intr->def, def);
