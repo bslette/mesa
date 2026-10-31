@@ -333,6 +333,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .GOOGLE_user_type = true,
       .MESA_image_alignment_control = true,
       .NV_compute_shader_derivatives = info->cls_eng3d >= TURING_A,
+      .NV_cooperative_matrix2 = info->cls_eng3d >= TURING_A,
       .NV_shader_atomic_float16_vector = info->cls_eng3d >= TURING_A,
       .NV_shader_sm_builtins = true,
       .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
@@ -513,6 +514,15 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* TU11X can run coop matrix but the performances are abysal */
       .cooperativeMatrix = info->cls_eng3d >= TURING_A && !is_tu11x,
       .cooperativeMatrixRobustBufferAccess = false,
+
+      /* VK_NV_cooperative_matrix2 */
+      .cooperativeMatrixWorkgroupScope = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixFlexibleDimensions = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixReductionsNV = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixConversionsNV = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixPerElementOperationsNV = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixTensorAddressing = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrixBlockLoads = info->cls_eng3d >= TURING_A && !is_tu11x,
 
       /* VK_KHR_compute_shader_derivatives */
       .computeDerivativeGroupQuads = info->cls_eng3d >= TURING_A,
@@ -1136,6 +1146,11 @@ nvk_get_device_properties(const struct nvk_instance *instance,
 
       /* VK_KHR_cooperative_matrix */
       .cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
+
+      /* VK_NV_cooperative_matrix2 */
+      .cooperativeMatrixWorkgroupScopeMaxWorkgroupSize = 256,
+      .cooperativeMatrixFlexibleDimensionsMaxDimension = 1024,
+      .cooperativeMatrixWorkgroupScopeReservedSharedMemory = 4096,
 
       /* VK_KHR_discard_rectangles */
       .maxDiscardRectangles = NVK_MAX_DISCARD_RECTANGLES,
@@ -2156,6 +2171,50 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
                   };
                }
             }
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixFlexibleDimensionsPropertiesNV *pProperties)
+{
+   VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixFlexibleDimensionsPropertiesNV,
+                          out, pProperties, pPropertyCount);
+
+   if (pdev->info.cls_compute < TURING_COMPUTE_A)
+      return VK_SUCCESS;
+
+   /* Flexible matrices are split into 16x16x16 pieces, only fp16 so far.
+    * Workgroup scope matrices are spread over the subgroups.
+    */
+   static const uint32_t wg_sizes[] = { 0, 128, 256 };
+   for (unsigned w = 0; w < ARRAY_SIZE(wg_sizes); w++) {
+      for (unsigned f32 = 0; f32 < 2; f32++) {
+         const VkComponentTypeKHR cd_type =
+            f32 ? VK_COMPONENT_TYPE_FLOAT32_KHR : VK_COMPONENT_TYPE_FLOAT16_KHR;
+
+         vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p)
+         {
+            *p = (struct VkCooperativeMatrixFlexibleDimensionsPropertiesNV){
+               .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+               .MGranularity = 16,
+               .NGranularity = 16,
+               .KGranularity = 16,
+               .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .CType = cd_type,
+               .ResultType = cd_type,
+               .saturatingAccumulation = false,
+               .scope = wg_sizes[w] ? VK_SCOPE_WORKGROUP_KHR
+                                    : VK_SCOPE_SUBGROUP_KHR,
+               .workgroupInvocations = wg_sizes[w],
+            };
          }
       }
    }
