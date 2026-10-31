@@ -369,6 +369,94 @@ lower_bit_size_cb(const nir_instr *instr, void *data)
    }
 }
 
+static bool
+type_has_flexible_cmat(const struct glsl_type *type)
+{
+   if (glsl_type_is_cmat(type)) {
+      const struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+      if (desc.scope != SCOPE_SUBGROUP)
+         return true;
+
+      /* Everything nak_nir_lower_cmat handles natively */
+      if (glsl_base_type_bit_size(desc.element_type) == 8)
+         return desc.rows * desc.cols > 16 * 32;
+      return desc.rows > 16 || desc.cols > 16;
+   }
+
+   if (glsl_type_is_array(type))
+      return type_has_flexible_cmat(glsl_get_array_element(type));
+
+   if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < glsl_get_length(type); i++) {
+         if (type_has_flexible_cmat(glsl_get_struct_field(type, i)))
+            return true;
+      }
+   }
+
+   return false;
+}
+
+/* The flexible dimension lowering splits every matrix into granularity
+ * sized pieces, which would also split the smaller KHR shapes we handle
+ * natively.  Only run it on shaders that need it.
+ */
+static bool
+nak_nir_has_flexible_cmat(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp) {
+      if (type_has_flexible_cmat(var->type))
+         return true;
+   }
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl) {
+         if (type_has_flexible_cmat(var->type))
+            return true;
+      }
+   }
+
+   return false;
+}
+
+static void
+nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak)
+{
+   UNUSED bool progress = false;
+
+   if (nir->info.stage != MESA_SHADER_COMPUTE ||
+       !nir->info.cs.has_cooperative_matrix)
+      return;
+
+   if (nak_nir_has_flexible_cmat(nir)) {
+      /* M16N8K16 is the native MMA, our 16x16 accumulators are two of them */
+      const struct nir_lower_coopmat_args coopmat_args = {
+         .m_gran = 16,
+         .n_gran = 16,
+         .k_gran = 16,
+      };
+      if (OPT(nir, nir_lower_cooperative_matrix_flexible_dimensions,
+              &coopmat_args)) {
+         OPT(nir, nir_opt_deref);
+         OPT(nir, nir_opt_dce);
+         OPT(nir, nir_remove_dead_variables,
+             nir_var_function_temp | nir_var_shader_temp, NULL);
+      }
+   }
+
+   if (!OPT(nir, nak_nir_lower_cmat, nak))
+      return;
+
+   /* Reduce, per-element and decode functions are now called per element */
+   OPT(nir, nir_opt_dce);
+   if (OPT(nir, nir_inline_functions)) {
+      OPT(nir, nir_opt_copy_prop_vars);
+      OPT(nir, nir_opt_copy_prop);
+   }
+   nir_remove_non_entrypoints(nir);
+   OPT(nir, nir_opt_deref);
+   OPT(nir, nir_opt_dce);
+}
+
 void
 nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
 {
@@ -398,7 +486,7 @@ nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
 
    OPT(nir, nir_lower_global_vars_to_local);
 
-   OPT(nir, nak_nir_lower_cmat, nak);
+   nak_nir_lower_cooperative_matrix(nir, nak);
 
    OPT(nir, nir_split_var_copies);
    OPT(nir, nir_split_struct_vars, nir_var_function_temp);
