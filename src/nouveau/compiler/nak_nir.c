@@ -428,7 +428,8 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
       return;
 
    if (nak_nir_has_flexible_cmat(nir)) {
-      OPT(nir, nak_nir_stage_cmat_tensor_loads);
+      nir_variable *stage_tile;
+      OPT(nir, nak_nir_stage_cmat_tensor_loads, &stage_tile);
 
       /* M16N8K16 is the native MMA, our 16x16 accumulators are two of them */
       const struct nir_lower_coopmat_args coopmat_args = {
@@ -436,6 +437,7 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
          .n_gran = 16,
          .k_gran = 16,
          .alias_shared_temps = true,
+         .shared_temp = stage_tile,
       };
       if (OPT(nir, nir_lower_cooperative_matrix_flexible_dimensions,
               &coopmat_args)) {
@@ -446,6 +448,7 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
          /* Strides must be constant for LDSM */
          OPT(nir, nir_opt_copy_prop);
          OPT(nir, nir_opt_constant_folding);
+         OPT(nir, nak_nir_sink_cmat_loads);
       }
    }
 
