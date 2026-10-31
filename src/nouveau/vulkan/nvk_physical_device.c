@@ -334,6 +334,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .MESA_image_alignment_control = true,
       .NV_compute_shader_derivatives = info->cls_eng3d >= TURING_A,
       .NV_cooperative_matrix2 = info->cls_eng3d >= TURING_A,
+      .NV_cooperative_matrix_decode_vector = info->cls_eng3d >= TURING_A,
       .NV_shader_atomic_float16_vector = info->cls_eng3d >= TURING_A,
       .NV_shader_sm_builtins = true,
       .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
@@ -523,6 +524,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       .cooperativeMatrixPerElementOperationsNV = info->cls_eng3d >= TURING_A && !is_tu11x,
       .cooperativeMatrixTensorAddressing = info->cls_eng3d >= TURING_A && !is_tu11x,
       .cooperativeMatrixBlockLoads = info->cls_eng3d >= TURING_A && !is_tu11x,
+
+      /* VK_NV_cooperative_matrix_decode_vector */
+      .cooperativeMatrixDecodeVector = info->cls_eng3d >= TURING_A && !is_tu11x,
 
       /* VK_KHR_compute_shader_derivatives */
       .computeDerivativeGroupQuads = info->cls_eng3d >= TURING_A,
