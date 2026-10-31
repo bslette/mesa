@@ -873,31 +873,33 @@ split_cmat_get_coordinate(nir_builder *b,
    nir_def *split_idx = nir_udiv(b, intr->src[0].ssa, length);
 
    nir_def *adds[2];
-   adds[0] = nir_udiv_imm(b, split_idx, box.outer_cols);
-   adds[1] = nir_umod_imm(b, split_idx, box.outer_cols);
    nir_def *def = nir_cmat_get_coordinate(b, rem_def, .cmat_desc = desc);
 
    if (box.wg_split) {
+      /* Same mapping as get_wg_split_offsets_imm(), with a dynamic index */
+      unsigned inner_count = (desc.use == GLSL_CMAT_USE_A) ? box.inner_cols :
+                             (desc.use == GLSL_CMAT_USE_B) ? box.inner_rows : 1;
+      nir_def *outer_idx = nir_udiv_imm(b, split_idx, inner_count);
+      nir_def *inner_idx = nir_umod_imm(b, split_idx, inner_count);
+      nir_def *row = nir_imul_imm(b, nir_udiv_imm(b, outer_idx, box.outer_cols), box.inner_rows);
+      nir_def *col = nir_imul_imm(b, nir_umod_imm(b, outer_idx, box.outer_cols), box.inner_cols);
       nir_def *sgid = nir_load_subgroup_id(b);
-      nir_def *inner_sg_row = nir_imm_int(b, 0);
-      nir_def *inner_sg_col = nir_imm_int(b, 0);
 
-      if (desc.use != GLSL_CMAT_USE_B &&
-          box.inner_rows > 1)
-         inner_sg_row = nir_umod_imm(b, nir_udiv_imm(b, sgid, box.inner_cols), box.inner_rows);
+      if (desc.use == GLSL_CMAT_USE_B)
+         row = nir_iadd(b, row, inner_idx);
+      else
+         row = nir_iadd(b, row, nir_umod_imm(b, nir_udiv_imm(b, sgid, box.inner_cols), box.inner_rows));
 
-      if (desc.use != GLSL_CMAT_USE_A)
-         inner_sg_col = nir_umod_imm(b, sgid, box.inner_cols);
+      if (desc.use == GLSL_CMAT_USE_A)
+         col = nir_iadd(b, col, inner_idx);
+      else
+         col = nir_iadd(b, col, nir_umod_imm(b, sgid, box.inner_cols));
 
-      adds[0] = nir_imul_imm(b,
-         nir_iadd(b, nir_imul_imm(b, adds[0], box.inner_cols), inner_sg_row),
-         desc.rows);
-      adds[1] = nir_imul_imm(b,
-         nir_iadd(b, nir_imul_imm(b, adds[1], box.inner_cols), inner_sg_col),
-         desc.cols);
+      adds[0] = nir_imul_imm(b, row, desc.rows);
+      adds[1] = nir_imul_imm(b, col, desc.cols);
    } else {
-      adds[0] = nir_imul_imm(b, adds[0], desc.rows);
-      adds[1] = nir_imul_imm(b, adds[1], desc.cols);
+      adds[0] = nir_imul_imm(b, nir_udiv_imm(b, split_idx, box.outer_cols), desc.rows);
+      adds[1] = nir_imul_imm(b, nir_umod_imm(b, split_idx, box.outer_cols), desc.cols);
    }
 
    nir_def *add_vec = nir_vec(b, adds, 2);
