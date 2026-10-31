@@ -868,6 +868,540 @@ lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr)
    store_cmat_src(b, intr->src[0], mat);
 }
 
+/* Register layout of a fragment: the PTX mma operand layouts, which is what
+ * the loads above produce for every memory layout.  A and accumulators are
+ * held by row, B by column.  A lane holds runs of group_size consecutive
+ * elements: 4 for 8-bit A/B and 2 otherwise.
+ */
+static unsigned
+cmat_group_size(struct glsl_cmat_description desc)
+{
+   return glsl_base_type_bit_size(desc.element_type) == 8 ? 4 : 2;
+}
+
+static void
+cmat_coord_imm(struct glsl_cmat_description desc, unsigned lane, unsigned i,
+               unsigned *row, unsigned *col)
+{
+   const unsigned gs = cmat_group_size(desc);
+   const unsigned g = lane >> 2, t = lane & 3;
+
+   if (desc.use == GLSL_CMAT_USE_B) {
+      *row = t * gs + (i % gs) + 4 * gs * ((i / gs) & 1);
+      *col = g + 8 * (i / (2 * gs));
+   } else {
+      *row = g + 8 * ((i / gs) & 1);
+      *col = t * gs + (i % gs) + 4 * gs * (i / (2 * gs));
+   }
+}
+
+static void
+cmat_coord(nir_builder *b, struct glsl_cmat_description desc,
+           nir_def *lane, nir_def *i, nir_def **row, nir_def **col)
+{
+   const unsigned gs = cmat_group_size(desc);
+   const unsigned gs_log2 = util_logbase2(gs);
+
+   nir_def *g = nir_ushr_imm(b, lane, 2);
+   nir_def *t = nir_iand_imm(b, lane, 3);
+   nir_def *in_group = nir_iand_imm(b, i, gs - 1);
+   nir_def *half = nir_iand_imm(b, nir_ushr_imm(b, i, gs_log2), 1);
+   nir_def *outer = nir_ushr_imm(b, i, gs_log2 + 1);
+
+   nir_def *run = nir_iadd(b, nir_imul_imm(b, t, gs), in_group);
+   if (desc.use == GLSL_CMAT_USE_B) {
+      *row = nir_iadd(b, run, nir_imul_imm(b, half, 4 * gs));
+      *col = nir_iadd(b, g, nir_imul_imm(b, outer, 8));
+   } else {
+      *row = nir_iadd(b, g, nir_imul_imm(b, half, 8));
+      *col = nir_iadd(b, run, nir_imul_imm(b, outer, 4 * gs));
+   }
+}
+
+/* Inverse of cmat_coord: the lane holding an element and its index there */
+static void
+cmat_lane_idx_imm(struct glsl_cmat_description desc, unsigned row, unsigned col,
+                  unsigned *lane, unsigned *idx)
+{
+   const unsigned gs = cmat_group_size(desc);
+
+   if (desc.use == GLSL_CMAT_USE_B) {
+      *lane = (col & 7) * 4 + (row % (4 * gs)) / gs;
+      *idx = row % gs + gs * ((row / (4 * gs)) & 1) + 2 * gs * (col >> 3);
+   } else {
+      *lane = (row & 7) * 4 + (col % (4 * gs)) / gs;
+      *idx = col % gs + gs * ((row >> 3) & 1) + 2 * gs * (col / (4 * gs));
+   }
+}
+
+static void
+cmat_lane_idx(nir_builder *b, struct glsl_cmat_description desc,
+              nir_def *row, nir_def *col, nir_def **lane, nir_def **idx)
+{
+   const unsigned gs = cmat_group_size(desc);
+   const unsigned gs_log2 = util_logbase2(gs);
+
+   /* Rows of A/C and columns of B are spread over the quads */
+   nir_def *spread = desc.use == GLSL_CMAT_USE_B ? col : row;
+   nir_def *run = desc.use == GLSL_CMAT_USE_B ? row : col;
+
+   nir_def *in_quad = nir_ushr_imm(b, nir_iand_imm(b, run, 4 * gs - 1), gs_log2);
+   *lane = nir_iadd(b, nir_imul_imm(b, nir_iand_imm(b, spread, 7), 4), in_quad);
+
+   nir_def *spread_half = nir_iand_imm(b, nir_ushr_imm(b, spread, 3), 1);
+   nir_def *run_half = nir_ushr_imm(b, run, gs_log2 + 2);
+   if (desc.use == GLSL_CMAT_USE_B)
+      SWAP(spread_half, run_half);
+   *idx = nir_iadd(b, nir_iand_imm(b, run, gs - 1),
+                   nir_iadd(b, nir_imul_imm(b, spread_half, gs),
+                            nir_imul_imm(b, run_half, 2 * gs)));
+}
+
+/* Fetches the element of src at (row, col) for every lane.  rows/cols are
+ * the same coordinates per lane at compile time, which lets us skip the
+ * shuffle when every lane reads its own data and pick only between the
+ * source components some lane actually needs.
+ */
+static nir_def *
+cmat_gather(nir_builder *b, struct glsl_cmat_description src_desc,
+            nir_def **src, const unsigned *rows, const unsigned *cols,
+            nir_def *row, nir_def *col)
+{
+   bool same_lane = true;
+   uint32_t idx_mask = 0;
+   for (unsigned l = 0; l < NAK_SUBGROUP_SIZE; l++) {
+      assert(rows[l] < src_desc.rows && cols[l] < src_desc.cols);
+      unsigned lane, idx;
+      cmat_lane_idx_imm(src_desc, rows[l], cols[l], &lane, &idx);
+      same_lane &= lane == l;
+      idx_mask |= BITFIELD_BIT(idx);
+   }
+
+   nir_def *lane, *idx;
+   cmat_lane_idx(b, src_desc, row, col, &lane, &idx);
+
+   nir_def *res = NULL;
+   u_foreach_bit(v, idx_mask) {
+      nir_def *val = same_lane ? src[v] : nir_shuffle(b, src[v], lane);
+      res = res ? nir_bcsel(b, nir_ieq_imm(b, idx, v), val, res) : val;
+   }
+   return res;
+}
+
+static void
+cmat_split(nir_builder *b, nir_def *mat, nir_def **comps)
+{
+   for (unsigned i = 0; i < mat->num_components; i++)
+      comps[i] = nir_channel(b, mat, i);
+}
+
+/* Conversions that change the use and/or transpose: move every element to
+ * the lane and component the destination layout wants it in.
+ */
+static nir_def *
+lower_cmat_relayout(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
+                    struct glsl_cmat_description src_desc,
+                    struct glsl_cmat_description dst_desc, bool transpose)
+{
+   nir_cmat_signed cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr);
+   enum glsl_base_type src_type = glsl_apply_signedness_to_base_type(
+      src_desc.element_type, cmat_signed_mask & NIR_CMAT_A_SIGNED);
+   enum glsl_base_type dst_type = glsl_apply_signedness_to_base_type(
+      dst_desc.element_type, cmat_signed_mask & NIR_CMAT_RESULT_SIGNED);
+   nir_op op =
+      nir_type_conversion_op(nir_get_nir_type_for_glsl_base_type(src_type),
+                             nir_get_nir_type_for_glsl_base_type(dst_type),
+                             nir_rounding_mode_undef);
+   bool conv_narrows =
+      glsl_base_type_bit_size(src_type) > glsl_base_type_bit_size(dst_type);
+
+   assert(transpose ? (src_desc.rows == dst_desc.cols &&
+                       src_desc.cols == dst_desc.rows)
+                    : (src_desc.rows == dst_desc.rows &&
+                       src_desc.cols == dst_desc.cols));
+
+   /* Shuffle the smaller values */
+   if (conv_narrows && op != nir_op_mov)
+      cmat = nir_build_alu1(b, op, cmat);
+
+   nir_def *src[NIR_MAX_VEC_COMPONENTS];
+   cmat_split(b, cmat, src);
+
+   nir_def *lane_id = nir_load_subgroup_invocation(b);
+   const unsigned dst_length = get_cmat_length(dst_desc);
+   nir_def *dst[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < dst_length; i++) {
+      unsigned rows[NAK_SUBGROUP_SIZE], cols[NAK_SUBGROUP_SIZE];
+      for (unsigned l = 0; l < NAK_SUBGROUP_SIZE; l++) {
+         cmat_coord_imm(dst_desc, l, i, &rows[l], &cols[l]);
+         if (transpose)
+            SWAP(rows[l], cols[l]);
+      }
+
+      nir_def *row, *col;
+      cmat_coord(b, dst_desc, lane_id, nir_imm_int(b, i), &row, &col);
+      if (transpose)
+         SWAP(row, col);
+
+      dst[i] = cmat_gather(b, src_desc, src, rows, cols, row, col);
+   }
+   cmat = nir_vec(b, dst, dst_length);
+
+   if (!conv_narrows && op != nir_op_mov)
+      cmat = nir_build_alu1(b, op, cmat);
+
+   return cmat;
+}
+
+static nir_def *
+cmat_combine(nir_builder *b, nir_function *fn, nir_def *x, nir_def *y)
+{
+   nir_variable *tmp =
+      nir_local_variable_create(b->impl,
+                                glsl_get_bare_type(fn->params[0].type),
+                                "cmat_reduce_tmp");
+   nir_deref_instr *deref = nir_build_deref_var(b, tmp);
+   nir_call(b, fn, &deref->def, x, y);
+   return nir_load_deref(b, deref);
+}
+
+static nir_def *
+cmat_combine_xor(nir_builder *b, nir_function *fn, nir_def *x,
+                 unsigned first_mask, unsigned last_mask)
+{
+   for (unsigned mask = first_mask; mask <= last_mask; mask <<= 1)
+      x = cmat_combine(b, fn, x, nir_shuffle_xor(b, x, nir_imm_int(b, mask)));
+   return x;
+}
+
+/* Fills dst from a fragment in which every element of the reduced rows
+ * and/or columns already holds the reduction.
+ */
+static void
+store_reduced(nir_builder *b, nir_deref_instr *dst_deref,
+              struct glsl_cmat_description src_desc, nir_def **src,
+              nir_cmat_reduce reduce)
+{
+   const struct glsl_cmat_description dst_desc =
+      *glsl_get_cmat_description(dst_deref->type);
+   const unsigned dst_length = get_cmat_length(dst_desc);
+   nir_def *dst[NIR_MAX_VEC_COMPONENTS];
+
+   if (dst_desc.rows == src_desc.rows && dst_desc.cols == src_desc.cols &&
+       dst_desc.use == src_desc.use) {
+      memcpy(dst, src, dst_length * sizeof(*dst));
+   } else {
+      nir_def *lane_id = nir_load_subgroup_invocation(b);
+      for (unsigned i = 0; i < dst_length; i++) {
+         unsigned rows[NAK_SUBGROUP_SIZE], cols[NAK_SUBGROUP_SIZE];
+         for (unsigned l = 0; l < NAK_SUBGROUP_SIZE; l++) {
+            cmat_coord_imm(dst_desc, l, i, &rows[l], &cols[l]);
+            if (!(reduce & NIR_CMAT_REDUCE_ROW))
+               rows[l] = 0;
+            if (!(reduce & NIR_CMAT_REDUCE_COLUMN))
+               cols[l] = 0;
+         }
+
+         nir_def *row, *col;
+         cmat_coord(b, dst_desc, lane_id, nir_imm_int(b, i), &row, &col);
+         if (!(reduce & NIR_CMAT_REDUCE_ROW))
+            row = nir_imm_int(b, 0);
+         if (!(reduce & NIR_CMAT_REDUCE_COLUMN))
+            col = nir_imm_int(b, 0);
+
+         dst[i] = cmat_gather(b, src_desc, src, rows, cols, row, col);
+      }
+   }
+
+   store_cmat_deref(b, dst_deref, nir_vec(b, dst, dst_length));
+}
+
+static void
+lower_cmat_reduce(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *src_deref = nir_src_as_deref(call->params[1]);
+   const struct glsl_cmat_description desc =
+      *glsl_get_cmat_description(src_deref->type);
+   const nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+   const unsigned length = get_cmat_length(desc);
+   const unsigned gs = cmat_group_size(desc);
+   nir_function *fn = call->callee;
+
+   assert(desc.use == GLSL_CMAT_USE_ACCUMULATOR);
+   assert(!(reduce & NIR_CMAT_REDUCE_2X2));
+
+   nir_def *v[NIR_MAX_VEC_COMPONENTS];
+   cmat_split(b, load_cmat_deref(b, src_deref), v);
+
+   if (reduce & NIR_CMAT_REDUCE_ROW) {
+      /* A lane holds two rows; the four lanes of a quad share them */
+      nir_def *red[2] = { NULL, NULL };
+      for (unsigned i = 0; i < length; i++) {
+         unsigned h = (i / gs) & 1;
+         red[h] = red[h] ? cmat_combine(b, fn, red[h], v[i]) : v[i];
+      }
+      for (unsigned h = 0; h < 2; h++) {
+         if (red[h])
+            red[h] = cmat_combine_xor(b, fn, red[h], 1, 2);
+      }
+      for (unsigned i = 0; i < length; i++)
+         v[i] = red[(i / gs) & 1];
+   }
+
+   if (reduce & NIR_CMAT_REDUCE_COLUMN) {
+      /* Element i and i + gs are the same column eight rows apart; the
+       * rows are spread over the eight quads.
+       */
+      for (unsigned i = 0; i < length; i++) {
+         if ((i / gs) & 1)
+            continue;
+         nir_def *red = v[i];
+         if (i + gs < length)
+            red = cmat_combine(b, fn, red, v[i + gs]);
+         red = cmat_combine_xor(b, fn, red, 4, 16);
+         v[i] = red;
+         if (i + gs < length)
+            v[i + gs] = red;
+      }
+   }
+
+   store_reduced(b, nir_src_as_deref(call->params[0]), desc, v, reduce);
+}
+
+static void
+lower_cmat_reduce_finish(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_def *src0 = load_cmat_src(b, call->params[1]);
+   nir_def *src1 = load_cmat_src(b, call->params[2]);
+
+   nir_def *v[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < src0->num_components; i++) {
+      v[i] = cmat_combine(b, call->callee, nir_channel(b, src0, i),
+                          nir_channel(b, src1, i));
+   }
+
+   store_cmat_src(b, call->params[0], nir_vec(b, v, src0->num_components));
+}
+
+/* dst is the 2x2 reduction of the matrix made of src0..3 (top left, top
+ * right, bottom left, bottom right), each the size of dst.
+ */
+static void
+lower_cmat_reduce_2x2(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst_deref = nir_src_as_deref(call->params[0]);
+   const struct glsl_cmat_description desc =
+      *glsl_get_cmat_description(dst_deref->type);
+   const unsigned length = get_cmat_length(desc);
+   const unsigned half_rows = desc.rows / 2, half_cols = desc.cols / 2;
+
+   nir_def *src[4][NIR_MAX_VEC_COMPONENTS];
+   for (unsigned q = 0; q < 4; q++) {
+      ASSERTED struct glsl_cmat_description src_desc =
+         cmat_src_desc(call->params[q + 1]);
+      assert(src_desc.rows == desc.rows && src_desc.cols == desc.cols &&
+             src_desc.use == desc.use);
+      cmat_split(b, load_cmat_src(b, call->params[q + 1]), src[q]);
+   }
+
+   nir_def *lane_id = nir_load_subgroup_invocation(b);
+   nir_def *v[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < length; i++) {
+      /* The quadrant only depends on the component */
+      unsigned r0, c0;
+      cmat_coord_imm(desc, 0, i, &r0, &c0);
+      const unsigned q_row = r0 / half_rows, q_col = c0 / half_cols;
+
+      unsigned rows[NAK_SUBGROUP_SIZE], cols[NAK_SUBGROUP_SIZE];
+      for (unsigned l = 0; l < NAK_SUBGROUP_SIZE; l++) {
+         cmat_coord_imm(desc, l, i, &rows[l], &cols[l]);
+         assert(rows[l] / half_rows == q_row && cols[l] / half_cols == q_col);
+         rows[l] = (rows[l] - q_row * half_rows) * 2;
+         cols[l] = (cols[l] - q_col * half_cols) * 2;
+      }
+
+      nir_def *row, *col;
+      cmat_coord(b, desc, lane_id, nir_imm_int(b, i), &row, &col);
+      row = nir_ishl_imm(b, nir_iadd_imm(b, row, -(int)(q_row * half_rows)), 1);
+      col = nir_ishl_imm(b, nir_iadd_imm(b, col, -(int)(q_col * half_cols)), 1);
+
+      nir_def **s = src[q_row * 2 + q_col];
+      nir_def *red = NULL;
+      for (unsigned d = 0; d < 4; d++) {
+         unsigned dr = d >> 1, dc = d & 1;
+         unsigned rows_d[NAK_SUBGROUP_SIZE], cols_d[NAK_SUBGROUP_SIZE];
+         for (unsigned l = 0; l < NAK_SUBGROUP_SIZE; l++) {
+            rows_d[l] = rows[l] + dr;
+            cols_d[l] = cols[l] + dc;
+         }
+         nir_def *val = cmat_gather(b, desc, s, rows_d, cols_d,
+                                    nir_iadd_imm(b, row, dr),
+                                    nir_iadd_imm(b, col, dc));
+         red = red ? cmat_combine(b, call->callee, red, val) : val;
+      }
+      v[i] = red;
+   }
+
+   store_cmat_deref(b, dst_deref, nir_vec(b, v, length));
+}
+
+static void
+lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst_deref = nir_src_as_deref(call->params[0]);
+   const struct glsl_cmat_description desc =
+      *glsl_get_cmat_description(dst_deref->type);
+   const unsigned length = get_cmat_length(desc);
+   const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
+
+   nir_def *src = load_cmat_src(b, call->params[3]);
+
+   /* Extra matrix operands are passed element by element */
+   nir_def *extra[call->num_params];
+   for (unsigned p = 0; p < call->num_params; p++) {
+      extra[p] = NULL;
+      if (p < 4)
+         continue;
+
+      nir_deref_instr *deref = nir_src_as_deref(call->params[p]);
+      if (deref && glsl_type_is_cmat(deref->type))
+         extra[p] = load_cmat_deref(b, deref);
+   }
+
+   nir_variable *elem_var =
+      nir_local_variable_create(b->impl, glsl_get_cmat_element(dst_deref->type),
+                                "cmat_elem_tmp");
+   nir_deref_instr *elem_deref = nir_build_deref_var(b, elem_var);
+   nir_def *lane_id = nir_load_subgroup_invocation(b);
+
+   nir_def *v[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < length; i++) {
+      nir_def *row, *col;
+      cmat_coord(b, desc, lane_id, nir_imm_int(b, i), &row, &col);
+
+      nir_call_instr *elem_call = nir_call_instr_create(b->shader, call->callee);
+      elem_call->params[0] = nir_src_for_ssa(&elem_deref->def);
+      elem_call->params[1] = nir_src_for_ssa(nir_iadd(b, call->params[1].ssa, row));
+      elem_call->params[2] = nir_src_for_ssa(nir_iadd(b, call->params[2].ssa, col));
+      elem_call->params[3] = nir_src_for_ssa(nir_channel(b, src, i));
+      for (unsigned p = 4; p < call->num_params; p++) {
+         nir_def *def = extra[p] ? nir_channel(b, extra[p], i)
+                                 : call->params[p].ssa;
+         elem_call->params[p] = nir_src_for_ssa(def);
+      }
+      nir_builder_instr_insert(b, &elem_call->instr);
+
+      v[i] = nir_build_load_deref(b, 1, bit_size, &elem_deref->def, 0);
+   }
+
+   store_cmat_deref(b, dst_deref, nir_vec(b, v, length));
+}
+
+static void
+lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
+{
+   const bool is_load = call->op == nir_cmat_call_op_tensor_load;
+   nir_deref_instr *cmat_deref = nir_src_as_deref(call->params[!is_load]);
+   const struct glsl_cmat_description desc =
+      *glsl_get_cmat_description(cmat_deref->type);
+   const unsigned length = get_cmat_length(desc);
+   const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
+   nir_deref_instr *deref = nir_src_as_deref(call->params[is_load]);
+
+   nir_def *vals[NIR_MAX_VEC_COMPONENTS];
+   nir_def *clips[NIR_MAX_VEC_COMPONENTS];
+   if (is_load)
+      cmat_split(b, load_cmat_src(b, call->params[4]), clips);
+   else
+      cmat_split(b, load_cmat_deref(b, cmat_deref), vals);
+
+   struct nir_calc_tensor_info info = { 0 };
+   nir_calc_tensor_derefs_init(b, &info, call);
+
+   /* Decode functions take a PhysicalStorageBuffer pointer */
+   if (info.decode_fnptr && nir_deref_mode_is(deref, nir_var_mem_ssbo)) {
+      nir_def *addr = nir_deref_buffer_address(b, 1, 64, &deref->def);
+      deref = nir_build_deref_cast(b, addr, nir_var_mem_global, deref->type,
+                                   bit_size / 8);
+   }
+
+   /* Subgroups beyond the matrix hold duplicates; don't let them store */
+   nir_if *sg_guard = NULL;
+   if (!is_load && info.wg) {
+      sg_guard = nir_push_if(b, nir_ilt_imm(b, nir_load_subgroup_id(b),
+                                            info.inner_rows * info.inner_cols));
+   }
+
+   nir_def *lane_id = nir_load_subgroup_invocation(b);
+   for (unsigned i = 0; i < length; i++) {
+      nir_def *row, *col;
+      cmat_coord(b, desc, lane_id, nir_imm_int(b, i), &row, &col);
+
+      nir_deref_instr *iter_deref = deref;
+      nir_def *res = nir_calc_tensor_derefs(b, &info, row, col, &iter_deref);
+
+      if (info.decode_fnptr) {
+         assert(is_load);
+         vals[i] = res;
+      } else if (is_load) {
+         vals[i] = nir_load_deref(b, iter_deref);
+         if (info.clamp_value) {
+            vals[i] = nir_bcsel(b, info.do_clamp,
+                                nir_u2uN(b, info.clamp_value, bit_size),
+                                vals[i]);
+         }
+      } else {
+         nir_push_if(b, nir_inot(b, info.do_clamp));
+         nir_store_deref(b, iter_deref, vals[i], 1);
+         nir_pop_if(b, NULL);
+      }
+
+      if (info.clipped_if) {
+         nir_push_else(b, info.clipped_if);
+         nir_pop_if(b, info.clipped_if);
+         if (is_load)
+            vals[i] = nir_if_phi(b, vals[i], clips[i]);
+         info.clipped_if = NULL;
+      }
+   }
+
+   if (sg_guard)
+      nir_pop_if(b, sg_guard);
+
+   if (is_load)
+      store_cmat_deref(b, cmat_deref, nir_vec(b, vals, length));
+}
+
+static bool
+lower_cmat_call(nir_builder *b, nir_cmat_call_instr *call)
+{
+   b->cursor = nir_before_instr(&call->instr);
+
+   switch (call->op) {
+   case nir_cmat_call_op_reduce:
+      lower_cmat_reduce(b, call);
+      break;
+   case nir_cmat_call_op_reduce_finish:
+      lower_cmat_reduce_finish(b, call);
+      break;
+   case nir_cmat_call_op_reduce_2x2:
+      lower_cmat_reduce_2x2(b, call);
+      break;
+   case nir_cmat_call_op_per_element_op:
+      lower_cmat_per_element_op(b, call);
+      break;
+   case nir_cmat_call_op_tensor_load:
+   case nir_cmat_call_op_tensor_store:
+      lower_cmat_tensor_load_store(b, call);
+      break;
+   default:
+      return false;
+   }
+
+   nir_instr_remove(&call->instr);
+   return true;
+}
+
 static bool
 lower_cmat_instr(nir_builder *b,
                  nir_instr *instr,
@@ -887,6 +1421,9 @@ lower_cmat_instr(nir_builder *b,
          return false;
       }
    }
+
+   if (instr->type == nir_instr_type_cmat_call)
+      return lower_cmat_call(b, nir_instr_as_cmat_call(instr));
 
    if (instr->type != nir_instr_type_intrinsic)
       return false;
@@ -1045,11 +1582,36 @@ lower_cmat_instr(nir_builder *b,
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *cmat = load_cmat_src(b, intr->src[1]);
-      nir_def *ret = lower_cmat_convert(b, intr, cmat, src_desc, dst_desc);
+      nir_def *ret = src_desc.use == dst_desc.use ?
+         lower_cmat_convert(b, intr, cmat, src_desc, dst_desc) :
+         lower_cmat_relayout(b, intr, cmat, src_desc, dst_desc, false);
       store_cmat_src(b, intr->src[0], ret);
 
       nir_instr_remove(instr);
       b->fp_math_ctrl = nir_fp_fast_math;
+      return true;
+   }
+
+   case nir_intrinsic_cmat_transpose: {
+      struct glsl_cmat_description dst_desc = cmat_src_desc(intr->src[0]);
+      struct glsl_cmat_description src_desc = cmat_src_desc(intr->src[1]);
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
+
+      nir_def *cmat = load_cmat_src(b, intr->src[1]);
+      nir_def *ret = lower_cmat_relayout(b, intr, cmat, src_desc, dst_desc, true);
+      store_cmat_src(b, intr->src[0], ret);
+
+      nir_instr_remove(instr);
+      b->fp_math_ctrl = nir_fp_fast_math;
+      return true;
+   }
+
+   case nir_intrinsic_cmat_get_coordinate: {
+      struct glsl_cmat_description desc = nir_intrinsic_cmat_desc(intr);
+      nir_def *row, *col;
+      cmat_coord(b, desc, nir_load_subgroup_invocation(b), intr->src[0].ssa,
+                 &row, &col);
+      nir_def_replace(&intr->def, nir_vec2(b, row, col));
       return true;
    }
 
