@@ -88,7 +88,7 @@ get_shared_temp(nir_builder *b, struct split_info *info,
 
    if (!info->scratch) {
       info->scratch = nir_variable_create(b->shader, nir_var_mem_shared,
-                                          glsl_array_type(glsl_uint_type(), 1, 4),
+                                          glsl_array_type(glsl_uvec4_type(), 1, 16),
                                           "cmat_shared_temp");
    }
    info->scratch_size = MAX2(info->scratch_size, size * elem_size);
@@ -109,8 +109,8 @@ finish_shared_temp(nir_shader *shader, struct split_info *info)
    if (!info->scratch)
       return;
 
-   info->scratch->type = glsl_array_type(glsl_uint_type(),
-                                         DIV_ROUND_UP(info->scratch_size, 4), 4);
+   info->scratch->type = glsl_array_type(glsl_uvec4_type(),
+                                         DIV_ROUND_UP(info->scratch_size, 16), 16);
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -1991,6 +1991,9 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
       .inner_box_rows = inner_box_rows,
       .inner_box_cols = inner_box_cols,
       .alias_shared_temps = args->alias_shared_temps,
+      .scratch = args->shared_temp,
+      .scratch_size = args->shared_temp ?
+                      glsl_get_explicit_size(args->shared_temp->type, false) : 0,
       .m_gran = args->m_gran,
       .n_gran = args->n_gran,
       .k_gran = args->k_gran,

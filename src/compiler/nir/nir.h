@@ -7669,6 +7669,11 @@ struct nir_lower_coopmat_args {
    unsigned k_gran;
    /* Use one shared memory buffer for all temporaries */
    bool alias_shared_temps;
+   /* With alias_shared_temps, a uvec4 array shared variable to use as
+    * that buffer (grown as needed).  Its other users must also wait for
+    * the workgroup before each use.
+    */
+   nir_variable *shared_temp;
 };
 
 bool nir_lower_cooperative_matrix_flexible_dimensions(nir_shader *shader,
