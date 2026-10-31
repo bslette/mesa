@@ -705,9 +705,10 @@ split_cmat_transpose(nir_builder *b,
       }
    } else {
       for (unsigned i = 0; i < dst_splits; i++) {
+         /* Source piece (r, c) becomes destination piece (c, r) */
          int r, c;
-         get_c_splits(&dst_split->box, i, &r, &c);
-         int out_idx = c * dst_split->box.outer_rows + r;
+         get_c_splits(&src_split->box, i, &r, &c);
+         int out_idx = c * dst_split->box.outer_cols + r;
          nir_deref_instr *dst_deref = recreate_derefs(b, &intr->src[0], dst_split->split_vars[out_idx]);
          nir_deref_instr *src_deref = recreate_derefs(b, &intr->src[1], src_split->split_vars[i]);
          b->cursor = nir_before_instr(instr);
@@ -879,7 +880,12 @@ split_cmat_muladd(nir_builder *b,
       assert(b_split);
       if (!a_split->box.wg_split)
          assert(b_split->box.outer_rows == a_split->box.outer_cols);
-      k_splits = a_split->box.wg_split ? a_split->box.inner_cols : a_split->box.outer_cols;
+      /* With a workgroup split, each subgroup holds inner_cols K pieces of
+       * every outer column of A.
+       */
+      k_splits = a_split->box.wg_split ?
+                 a_split->box.outer_cols * a_split->box.inner_cols :
+                 a_split->box.outer_cols;
    }
 
    for (unsigned m = 0; m < m_splits; m++) {
@@ -889,7 +895,14 @@ split_cmat_muladd(nir_builder *b,
          nir_deref_instr *c_deref = c_split ? recreate_derefs(b, &intr->src[3], c_split->split_vars[idx]) : nir_src_as_deref(intr->src[3]);
 
          for (unsigned k = 0; k < k_splits; k++) {
-            unsigned a_idx = (a_split && a_split->box.wg_split) ? m * a_split->box.inner_cols + k : (m * k_splits + k);
+            unsigned a_idx;
+            if (a_split && a_split->box.wg_split) {
+               /* Same order as get_wg_split_offsets_imm() */
+               unsigned a_inner = a_split->box.inner_cols;
+               a_idx = (m * a_split->box.outer_cols + k / a_inner) * a_inner + k % a_inner;
+            } else {
+               a_idx = m * k_splits + k;
+            }
             unsigned b_idx;
             if (b_split && b_split->box.wg_split) {
                unsigned b_outer_row = k / b_split->box.inner_rows;
@@ -1029,16 +1042,24 @@ split_cmat_reduce_row_col(nir_builder *b,
             call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
          }
       } else if (reduce & NIR_CMAT_REDUCE_ROW) {
-         for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* Combine each row of pieces into its first piece */
+         const unsigned cols = src_split->box.outer_cols;
+         for (unsigned r = 0; r < src_split->box.outer_rows; r++) {
+            for (unsigned c = 1; c < cols; c++) {
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &temp_derefs[r * cols]->def,
+                                  &temp_derefs[r * cols]->def, &temp_derefs[r * cols + c]->def);
+            }
          }
       } else if (reduce & NIR_CMAT_REDUCE_COLUMN) {
-         for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* Combine each column of pieces into its first piece */
+         const unsigned cols = src_split->box.outer_cols;
+         for (unsigned c = 0; c < cols; c++) {
+            for (unsigned r = 1; r < src_split->box.outer_rows; r++) {
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &temp_derefs[c]->def,
+                                  &temp_derefs[c]->def, &temp_derefs[r * cols + c]->def);
+            }
          }
       }
    }
@@ -1053,7 +1074,8 @@ split_cmat_reduce_row_col(nir_builder *b,
             if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) == (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
                idx = 0;
             else if (reduce & NIR_CMAT_REDUCE_ROW)
-               idx = r % (src_split ? src_split->box.outer_rows : 1);
+               idx = (r % (src_split ? src_split->box.outer_rows : 1)) *
+                     (src_split ? src_split->box.outer_cols : 1);
             else if (reduce & NIR_CMAT_REDUCE_COLUMN)
                idx = c % (src_split ? src_split->box.outer_cols : 1);
             else
@@ -1676,7 +1698,21 @@ split_cmat_call_per_element_op(nir_builder *b,
             new_call->params[j] = call->params[j];
       }
       b->cursor = nir_before_instr(instr);
-      nir_builder_instr_insert(b, &new_call->instr);
+      if (dst_split->box.wg_split) {
+         /* Subgroups beyond the matrix hold copies of other subgroups'
+          * pieces.  The function may have side effects, like storing the
+          * element, so don't run it for those.
+          */
+         nir_def *sgid = nir_load_subgroup_id(b);
+         nir_push_if(b, nir_ilt_imm(b, sgid, src_split->box.inner_rows *
+                                             src_split->box.inner_cols));
+         nir_builder_instr_insert(b, &new_call->instr);
+         nir_push_else(b, NULL);
+         nir_cmat_copy(b, &dst_deref->def, &src_deref->def);
+         nir_pop_if(b, NULL);
+      } else {
+         nir_builder_instr_insert(b, &new_call->instr);
+      }
    }
    nir_instr_remove(instr);
    return true;
@@ -2198,7 +2234,8 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
 
       nir_def *this_clamp;
       if (info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED) {
-         this_clamp = nir_ior(b, nir_ilt_imm(b, c, 0), nir_ige(b, c, nir_channel(b, info->layout_dims, dim)));
+         /* Dimensions are unsigned, e.g. ~0 for "never clamp" */
+         this_clamp = nir_ior(b, nir_ilt_imm(b, c, 0), nir_uge(b, c, nir_channel(b, info->layout_dims, dim)));
          info->do_clamp = nir_ior(b, info->do_clamp, this_clamp);
       } else
          this_clamp = nir_imm_false(b);
