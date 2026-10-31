@@ -2205,12 +2205,15 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
        * and the parameter is filled a pointer computed by multiplying the index returned by
        * matrixCoordToTensorElement(WithView) by the size of the pointee type.
        */
+      const struct glsl_type *block_type =
+         decode_fn->cmat_decode_type ? decode_fn->cmat_decode_type :
+         param_deref ? param_deref->type : NULL;
       nir_def *idx_def;
-      if (param_deref) {
+      if (block_type) {
          nir_deref_instr *idx_deref = nir_build_deref_cast(b, &iter_deref->def,
                                                            iter_deref->modes,
-                                                           param_deref->type,
-                                                           glsl_get_explicit_size(param_deref->type, true));
+                                                           block_type,
+                                                           glsl_get_explicit_size(block_type, true));
          idx_deref = nir_build_deref_ptr_as_array(b, idx_deref, nir_u2uN(b, idx, iter_deref->def.bit_size));
          idx_def = &idx_deref->def;
       } else

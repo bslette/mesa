@@ -2090,6 +2090,8 @@ write_function(write_ctx *ctx, const nir_function *fxn)
       flags |= 0x100;
    if (fxn->cmat_call)
       flags |= 0x200;
+   if (fxn->cmat_decode_type)
+      flags |= 0x400;
    blob_write_uint32(ctx->blob, flags);
    if (fxn->name && !ctx->strip)
       blob_write_string(ctx->blob, fxn->name);
@@ -2099,6 +2101,9 @@ write_function(write_ctx *ctx, const nir_function *fxn)
       blob_write_uint32(ctx->blob, fxn->workgroup_size[1]);
       blob_write_uint32(ctx->blob, fxn->workgroup_size[2]);
    }
+
+   if (flags & 0x400)
+      encode_type_to_blob(ctx->blob, fxn->cmat_decode_type);
 
    blob_write_uint32(ctx->blob, fxn->driver_attributes);
 
@@ -2155,6 +2160,9 @@ read_function(read_ctx *ctx)
       fxn->workgroup_size[1] = blob_read_uint32(ctx->blob);
       fxn->workgroup_size[2] = blob_read_uint32(ctx->blob);
    }
+
+   if (flags & 0x400)
+      fxn->cmat_decode_type = decode_type_from_blob(ctx->blob);
 
    fxn->driver_attributes = blob_read_uint32(ctx->blob);
    fxn->subroutine_index = blob_read_uint32(ctx->blob);

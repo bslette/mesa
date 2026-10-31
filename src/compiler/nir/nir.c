@@ -621,6 +621,7 @@ nir_function_create(nir_shader *shader, const char *name)
    func->impl = NULL;
    func->is_entrypoint = false;
    func->cmat_call = false;
+   func->cmat_decode_type = NULL;
    func->is_preamble = false;
    func->dont_inline = false;
    func->should_inline = false;

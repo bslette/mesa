@@ -4340,6 +4340,10 @@ typedef struct nir_function {
    bool is_entrypoint;
    /* called by a cmat call */
    bool cmat_call;
+   /* For tensor load decode functions: the type the block pointer points
+    * to, whose size is the size of a block.
+    */
+   const struct glsl_type *cmat_decode_type;
    /* from SPIR-V linkage, only for libraries */
    bool is_exported;
    bool is_preamble;

@@ -58,6 +58,19 @@ vtn_handle_cooperative_type(struct vtn_builder *b, struct vtn_value *val,
    val->type->component_type = component_type;
 }
 
+/* The block pointer passed to a decode function advances by the size of
+ * the type its first parameter points to.  The function body may cast the
+ * pointer to other types, so record the declared one.
+ */
+static void
+vtn_set_cmat_decode_type(struct vtn_builder *b, struct vtn_function *fn)
+{
+   const struct vtn_type *ptr_type = fn->type->params[0];
+   vtn_fail_if(ptr_type->base_type != vtn_base_type_pointer,
+               "Decode function block parameter must be a pointer");
+   fn->nir_func->cmat_decode_type = ptr_type->pointed->type;
+}
+
 static enum glsl_matrix_layout
 vtn_matrix_layout_to_glsl(SpvCooperativeMatrixLayout layout)
 {
@@ -350,12 +363,14 @@ vtn_handle_cooperative_instruction(struct vtn_builder *b, SpvOp opcode,
          decode_fn = vtn_value(b, w[idx], vtn_value_type_function)->func;
          decode_fn->referenced = true;
          decode_fn->nir_func->cmat_call = true;
+         vtn_set_cmat_decode_type(b, decode_fn);
          idx++;
       }
       if (tensor_addressing & SpvTensorAddressingOperandsDecodeVectorFuncMask) {
          decode_vec_fn = vtn_value(b, w[idx], vtn_value_type_function)->func;
          decode_vec_fn->referenced = true;
          decode_vec_fn->nir_func->cmat_call = true;
+         vtn_set_cmat_decode_type(b, decode_vec_fn);
          idx++;
       }
       assert(idx == count);
