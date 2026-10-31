@@ -1657,15 +1657,21 @@ lower_cmat_impl(nir_function_impl *impl,
       }
    }
 
+   /* Tensor loads and stores add control flow */
+   bool added_cf = false;
    nir_builder b = nir_builder_create(impl);
    nir_foreach_block_reverse_safe(block, impl) {
       nir_foreach_instr_reverse_safe(instr, block) {
-         if (lower_cmat_instr(&b, instr, type_mapping, nak))
+         const bool is_call = instr->type == nir_instr_type_cmat_call;
+         if (lower_cmat_instr(&b, instr, type_mapping, nak)) {
             progress = true;
+            added_cf |= is_call;
+         }
       }
    }
 
-   return nir_progress(progress, impl, nir_metadata_control_flow);
+   return nir_progress(progress, impl, added_cf ? nir_metadata_none
+                                                : nir_metadata_control_flow);
 }
 
 bool
@@ -1858,7 +1864,7 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir)
       }
    }
 
-   if (max_elems == 0) {
+   if (max_elems == 0 || getenv("NAK_CMAT_NO_STAGE")) {
       nir_foreach_function_impl(fimpl, nir)
          nir_no_progress(fimpl);
       return false;
