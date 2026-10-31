@@ -1297,6 +1297,40 @@ lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call)
    store_cmat_deref(b, dst_deref, nir_vec(b, v, length));
 }
 
+/* Decode functions take a PhysicalStorageBuffer pointer */
+static nir_deref_instr *
+tensor_load_base(nir_builder *b, const struct nir_calc_tensor_info *info,
+                 nir_deref_instr *deref, unsigned bit_size)
+{
+   if (info->decode_fnptr && nir_deref_mode_is(deref, nir_var_mem_ssbo)) {
+      nir_def *addr = nir_deref_buffer_address(b, 1, 64, &deref->def);
+      deref = nir_build_deref_cast(b, addr, nir_var_mem_global, deref->type,
+                                   bit_size / 8);
+   }
+   return deref;
+}
+
+/* Loads (or decodes) the element at (row, col).  With a tensor view this
+ * leaves info->clipped_if open with the cursor in its then branch.
+ */
+static nir_def *
+tensor_load_elem(nir_builder *b, struct nir_calc_tensor_info *info,
+                 nir_deref_instr *deref, nir_def *row, nir_def *col,
+                 unsigned bit_size)
+{
+   nir_deref_instr *iter_deref = deref;
+   nir_def *res = nir_calc_tensor_derefs(b, info, row, col, &iter_deref);
+   if (info->decode_fnptr)
+      return res;
+
+   nir_def *val = nir_load_deref(b, iter_deref);
+   if (info->clamp_value) {
+      val = nir_bcsel(b, info->do_clamp,
+                      nir_u2uN(b, info->clamp_value, bit_size), val);
+   }
+   return val;
+}
+
 static void
 lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
 {
@@ -1318,12 +1352,7 @@ lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
    struct nir_calc_tensor_info info = { 0 };
    nir_calc_tensor_derefs_init(b, &info, call);
 
-   /* Decode functions take a PhysicalStorageBuffer pointer */
-   if (info.decode_fnptr && nir_deref_mode_is(deref, nir_var_mem_ssbo)) {
-      nir_def *addr = nir_deref_buffer_address(b, 1, 64, &deref->def);
-      deref = nir_build_deref_cast(b, addr, nir_var_mem_global, deref->type,
-                                   bit_size / 8);
-   }
+   deref = tensor_load_base(b, &info, deref, bit_size);
 
    /* Subgroups beyond the matrix hold duplicates; don't let them store */
    nir_if *sg_guard = NULL;
@@ -1337,20 +1366,11 @@ lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
       nir_def *row, *col;
       cmat_coord(b, desc, lane_id, nir_imm_int(b, i), &row, &col);
 
-      nir_deref_instr *iter_deref = deref;
-      nir_def *res = nir_calc_tensor_derefs(b, &info, row, col, &iter_deref);
-
-      if (info.decode_fnptr) {
-         assert(is_load);
-         vals[i] = res;
-      } else if (is_load) {
-         vals[i] = nir_load_deref(b, iter_deref);
-         if (info.clamp_value) {
-            vals[i] = nir_bcsel(b, info.do_clamp,
-                                nir_u2uN(b, info.clamp_value, bit_size),
-                                vals[i]);
-         }
+      if (is_load) {
+         vals[i] = tensor_load_elem(b, &info, deref, row, col, bit_size);
       } else {
+         nir_deref_instr *iter_deref = deref;
+         nir_calc_tensor_derefs(b, &info, row, col, &iter_deref);
          nir_push_if(b, nir_inot(b, info.do_clamp));
          nir_store_deref(b, iter_deref, vals[i], 1);
          nir_pop_if(b, NULL);
@@ -1677,4 +1697,193 @@ nak_nir_lower_cmat(nir_shader *nir, const struct nak_compiler *nak)
 
    _mesa_hash_table_destroy(type_mapping, NULL);
    return progress;
+}
+
+/* The largest tile we stage, and what we report as
+ * cooperativeMatrixWorkgroupScopeReservedSharedMemory.
+ */
+#define NAK_CMAT_STAGE_MAX_BYTES (16 * 1024)
+
+/* Pad rows (columns for B) by 16 bytes so that the eight 16-byte rows an
+ * LDSM reads land in different banks.
+ */
+#define NAK_CMAT_STAGE_PAD 8
+
+static void
+stage_tensor_load(nir_builder *b, nir_cmat_call_instr *call,
+                  nir_variable *tile, unsigned wg_size)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   const struct glsl_cmat_description desc = *glsl_get_cmat_description(dst->type);
+   const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
+   const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+
+   /* A is stored row-major and B column-major, which are the layouts LDSM
+    * loads them from.  The contiguous dimension is filled by consecutive
+    * invocations.
+    */
+   const bool col_major = desc.use == GLSL_CMAT_USE_B;
+   const unsigned inner = col_major ? desc.rows : desc.cols;
+   const unsigned outer = col_major ? desc.cols : desc.rows;
+   const unsigned stride = inner + NAK_CMAT_STAGE_PAD;
+   const unsigned total = inner * outer;
+   const enum glsl_matrix_layout layout =
+      col_major ? GLSL_MATRIX_LAYOUT_COLUMN_MAJOR : GLSL_MATRIX_LAYOUT_ROW_MAJOR;
+
+   b->cursor = nir_before_instr(&call->instr);
+
+   nir_deref_instr *tile_deref = nir_build_deref_var(b, tile);
+   nir_deref_instr *tile_base = nir_build_deref_array_imm(b, tile_deref, 0);
+
+   /* Readers of the previous tile are done */
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+   struct nir_calc_tensor_info info = { 0 };
+   nir_calc_tensor_derefs_init(b, &info, call);
+
+   /* Clipped elements come from the clip matrix.  Put it in the tile first
+    * unless the view can't clip.
+    */
+   if (tl.tensor_view) {
+      nir_def *no_clip =
+         nir_iand(b, nir_iand(b, nir_ieq_imm(b, info.clip_row_offset, 0),
+                                 nir_ieq_imm(b, info.clip_col_offset, 0)),
+                     nir_iand(b, nir_uge_imm(b, info.clip_row_span, desc.rows),
+                                 nir_uge_imm(b, info.clip_col_span, desc.cols)));
+      nir_push_if(b, nir_inot(b, no_clip));
+      nir_cmat_store(b, &tile_base->def, call->params[4].ssa,
+                     nir_imm_int(b, stride), .matrix_layout = layout);
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_WORKGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_shared);
+      nir_pop_if(b, NULL);
+   }
+
+   nir_deref_instr *base = tensor_load_base(b, &info,
+                                            nir_src_as_deref(call->params[1]),
+                                            bit_size);
+
+   nir_def *li = nir_load_local_invocation_index(b);
+   for (unsigned e0 = 0; e0 < total; e0 += wg_size) {
+      nir_def *e = nir_iadd_imm(b, li, e0);
+      nir_if *tail = NULL;
+      if (e0 + wg_size > total)
+         tail = nir_push_if(b, nir_ult_imm(b, e, total));
+
+      nir_def *in = nir_iand_imm(b, e, inner - 1);
+      nir_def *out = nir_ushr_imm(b, e, util_logbase2(inner));
+      nir_def *row = col_major ? in : out;
+      nir_def *col = col_major ? out : in;
+
+      nir_def *val = tensor_load_elem(b, &info, base, row, col, bit_size);
+      nir_def *off = nir_iadd(b, nir_imul_imm(b, out, stride), in);
+      nir_store_deref(b, nir_build_deref_array(b, tile_deref, off), val, 1);
+
+      if (info.clipped_if) {
+         nir_pop_if(b, info.clipped_if);
+         info.clipped_if = NULL;
+      }
+      if (tail)
+         nir_pop_if(b, tail);
+   }
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+   nir_cmat_load(b, &dst->def, &tile_base->def, nir_imm_int(b, stride),
+                 .matrix_layout = layout);
+
+   nir_instr_remove(&call->instr);
+}
+
+static unsigned
+staged_tile_elems(const struct glsl_cmat_description desc)
+{
+   const unsigned inner = desc.use == GLSL_CMAT_USE_B ? desc.rows : desc.cols;
+   const unsigned outer = desc.use == GLSL_CMAT_USE_B ? desc.cols : desc.rows;
+   return outer * (inner + NAK_CMAT_STAGE_PAD);
+}
+
+static bool
+can_stage_tensor_load(nir_cmat_call_instr *call)
+{
+   if (call->op != nir_cmat_call_op_tensor_load || call->decode_vec_fn)
+      return false;
+
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   const struct glsl_cmat_description desc = *glsl_get_cmat_description(dst->type);
+   const unsigned inner = desc.use == GLSL_CMAT_USE_B ? desc.rows : desc.cols;
+
+   return desc.scope == SCOPE_WORKGROUP &&
+          desc.use != GLSL_CMAT_USE_ACCUMULATOR &&
+          desc.element_type == GLSL_TYPE_FLOAT16 &&
+          util_is_power_of_two_nonzero(inner) &&
+          staged_tile_elems(desc) * 2 <= NAK_CMAT_STAGE_MAX_BYTES;
+}
+
+/* Workgroup scope matrices are split into one piece per subgroup, and each
+ * subgroup would load (and decode) every A or B element it needs on its
+ * own, straight from memory.  Instead, have the whole workgroup load each
+ * element once into shared memory and let the subgroups load their pieces
+ * from there.  Workgroup scope loads are in workgroup uniform control flow.
+ */
+bool
+nak_nir_stage_cmat_tensor_loads(nir_shader *nir)
+{
+   if (nir->info.workgroup_size_variable)
+      return false;
+
+   const unsigned wg_size = nir->info.workgroup_size[0] *
+                            nir->info.workgroup_size[1] *
+                            nir->info.workgroup_size[2];
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   unsigned max_elems = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_cmat_call)
+            continue;
+         nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+         if (!can_stage_tensor_load(call))
+            continue;
+         nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+         max_elems = MAX2(max_elems,
+                          staged_tile_elems(*glsl_get_cmat_description(dst->type)));
+      }
+   }
+
+   if (max_elems == 0) {
+      nir_foreach_function_impl(fimpl, nir)
+         nir_no_progress(fimpl);
+      return false;
+   }
+
+   /* One tile for all loads: each fill waits for the readers of the last */
+   nir_variable *tile =
+      nir_variable_create(nir, nir_var_mem_shared,
+                          glsl_array_type(glsl_float16_t_type(), max_elems, 2),
+                          "nak_cmat_stage");
+
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_cmat_call)
+            continue;
+         nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+         if (can_stage_tensor_load(call))
+            stage_tensor_load(&b, call, tile, wg_size);
+      }
+   }
+
+   nir_foreach_function_impl(fimpl, nir) {
+      if (fimpl != impl)
+         nir_no_progress(fimpl);
+   }
+   return nir_progress(true, impl, nir_metadata_none);
 }

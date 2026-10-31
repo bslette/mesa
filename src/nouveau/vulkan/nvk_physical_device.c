@@ -1150,7 +1150,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       /* VK_NV_cooperative_matrix2 */
       .cooperativeMatrixWorkgroupScopeMaxWorkgroupSize = 256,
       .cooperativeMatrixFlexibleDimensionsMaxDimension = 1024,
-      .cooperativeMatrixWorkgroupScopeReservedSharedMemory = 4096,
+      .cooperativeMatrixWorkgroupScopeReservedSharedMemory = 16 * 1024,
 
       /* VK_KHR_discard_rectangles */
       .maxDiscardRectangles = NVK_MAX_DISCARD_RECTANGLES,

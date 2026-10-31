@@ -428,11 +428,14 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
       return;
 
    if (nak_nir_has_flexible_cmat(nir)) {
+      OPT(nir, nak_nir_stage_cmat_tensor_loads);
+
       /* M16N8K16 is the native MMA, our 16x16 accumulators are two of them */
       const struct nir_lower_coopmat_args coopmat_args = {
          .m_gran = 16,
          .n_gran = 16,
          .k_gran = 16,
+         .alias_shared_temps = true,
       };
       if (OPT(nir, nir_lower_cooperative_matrix_flexible_dimensions,
               &coopmat_args)) {
@@ -440,6 +443,9 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
          OPT(nir, nir_opt_dce);
          OPT(nir, nir_remove_dead_variables,
              nir_var_function_temp | nir_var_shader_temp, NULL);
+         /* Strides must be constant for LDSM */
+         OPT(nir, nir_opt_copy_prop);
+         OPT(nir, nir_opt_constant_folding);
       }
    }
 
@@ -453,6 +459,8 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
       OPT(nir, nir_opt_copy_prop);
    }
    nir_remove_non_entrypoints(nir);
+   /* Globals the callees used are now only used by the entrypoint */
+   OPT(nir, nir_lower_global_vars_to_local);
    OPT(nir, nir_opt_deref);
    OPT(nir, nir_opt_dce);
 }
