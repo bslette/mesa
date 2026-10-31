@@ -206,6 +206,10 @@ pub extern "C" fn nak_compiler_create(
         sm: dev.sm,
         warps_per_sm: dev.max_warps_per_mp,
         nir_options: nir_options(dev),
+        nir_options_vec_bounds: nir_shader_compiler_options {
+            robust_vec_bounds_check: true,
+            ..nir_options(dev)
+        },
     });
 
     Box::into_raw(nak)
@@ -228,6 +232,15 @@ pub extern "C" fn nak_nir_options(
     assert!(!nak.is_null());
     let nak = unsafe { &*nak };
     &nak.nir_options
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nak_nir_options_vec_bounds(
+    nak: *const nak_compiler,
+) -> *const nir_shader_compiler_options {
+    assert!(!nak.is_null());
+    let nak = unsafe { &*nak };
+    &nak.nir_options_vec_bounds
 }
 
 #[unsafe(no_mangle)]

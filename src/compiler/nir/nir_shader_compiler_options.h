@@ -741,6 +741,14 @@ typedef struct nir_shader_compiler_options {
    /** Backend supports load_global_bounded intrinsics. */
    bool has_load_global_bounded;
 
+   /**
+    * Bounds-checked SSBO vector loads of up to 16 bytes may be checked as a
+    * whole and read as zero when any part is out of bounds, as
+    * robustBufferAccess (but not robustBufferAccess2) allows.  Otherwise
+    * nir_lower_explicit_io checks each component on its own.
+    */
+   bool robust_vec_bounds_check;
+
    /** Backend supports load/store_global_offset*/
    bool has_global_offset;
 

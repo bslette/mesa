@@ -1488,8 +1488,20 @@ nir_lower_explicit_io_instr(nir_builder *b,
     * that information through to nir_lower_explicit_io.  For now, however,
     * scalarizing is at least correct.
     */
+   const bool vec_bounds_check =
+      addr_format_needs_bounds_check(addr_format) &&
+      b->shader->options->robust_vec_bounds_check &&
+      intrin->intrinsic == nir_intrinsic_load_deref &&
+      deref->modes == nir_var_mem_ssbo &&
+      vec_stride == scalar_size &&
+      /* Back-ends may over-fetch other sizes up to a power of two, and the
+       * bounds check would grow with the load.
+       */
+      util_is_power_of_two_nonzero(intrin->num_components) &&
+      intrin->num_components * scalar_size <= 16;
    bool scalarize = vec_stride > scalar_size ||
-                    addr_format_needs_bounds_check(addr_format);
+                    (addr_format_needs_bounds_check(addr_format) &&
+                     !vec_bounds_check);
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_deref: {

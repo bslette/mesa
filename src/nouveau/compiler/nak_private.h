@@ -22,6 +22,8 @@ struct nak_compiler {
    uint8_t warps_per_sm;
 
    struct nir_shader_compiler_options nir_options;
+   /* nir_options with robust_vec_bounds_check, for robustBufferAccess */
+   struct nir_shader_compiler_options nir_options_vec_bounds;
 };
 
 enum ENUM_PACKED nak_attr {

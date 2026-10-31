@@ -90,10 +90,13 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
 static const nir_shader_compiler_options *
 nvk_get_nir_options(struct vk_physical_device *vk_pdev,
                     mesa_shader_stage stage,
-                    UNUSED const struct vk_pipeline_robustness_state *rs)
+                    const struct vk_pipeline_robustness_state *rs)
 {
    const struct nvk_physical_device *pdev =
       container_of(vk_pdev, struct nvk_physical_device, vk);
+   if (rs != NULL && rs->storage_buffers ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT)
+      return nak_nir_options_vec_bounds(pdev->nak);
    return nak_nir_options(pdev->nak);
 }
 
