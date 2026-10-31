@@ -46,6 +46,9 @@ struct split_info {
    unsigned num_sg_mat_per_wg;
    unsigned inner_box_rows;
    unsigned inner_box_cols;
+   bool alias_shared_temps;
+   nir_variable *scratch;
+   unsigned scratch_size;
 };
 
 static struct split_var_info *find_type_info(struct hash_table *split_var_info,
@@ -60,6 +63,65 @@ get_shared_array_type(const struct glsl_cmat_description desc, unsigned size)
 {
    const struct glsl_type *scalar_type = glsl_simple_type(desc.element_type, 1, 1);
    return glsl_array_type(scalar_type, size, 0);
+}
+
+/*
+ * Shared memory for moving matrices between subgroups.  Each user writes,
+ * waits for the workgroup and reads.  With alias_shared_temps all users
+ * share one buffer, and wait for the readers of the previous user first.
+ */
+static nir_deref_instr *
+get_shared_temp(nir_builder *b, struct split_info *info,
+                const struct glsl_cmat_description desc, unsigned size,
+                const char *name)
+{
+   if (!info->alias_shared_temps) {
+      nir_variable *var = nir_variable_create(b->shader, nir_var_mem_shared,
+                                              get_shared_array_type(desc, size),
+                                              name);
+      return nir_build_deref_var(b, var);
+   }
+
+   const struct glsl_type *scalar_type = glsl_simple_type(desc.element_type, 1, 1);
+   const unsigned elem_size = glsl_get_explicit_size(scalar_type, false);
+   const struct glsl_type *type = glsl_array_type(scalar_type, size, elem_size);
+
+   if (!info->scratch) {
+      info->scratch = nir_variable_create(b->shader, nir_var_mem_shared,
+                                          glsl_array_type(glsl_uint_type(), 1, 4),
+                                          "cmat_shared_temp");
+   }
+   info->scratch_size = MAX2(info->scratch_size, size * elem_size);
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+
+   nir_deref_instr *deref = nir_build_deref_var(b, info->scratch);
+   return nir_build_deref_cast_with_alignment(b, &deref->def, nir_var_mem_shared,
+                                              type, 0, 16, 0);
+}
+
+static void
+finish_shared_temp(nir_shader *shader, struct split_info *info)
+{
+   if (!info->scratch)
+      return;
+
+   info->scratch->type = glsl_array_type(glsl_uint_type(),
+                                         DIV_ROUND_UP(info->scratch_size, 4), 4);
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type == nir_deref_type_var && deref->var == info->scratch)
+               deref->type = info->scratch->type;
+         }
+      }
+   }
 }
 
 static unsigned get_num_splits_box(const struct split_box *box, enum glsl_cmat_use use)
@@ -502,11 +564,9 @@ split_cmat_convert(nir_builder *b,
       /* allocate shared memory for whole matrix */
       struct glsl_cmat_description cmat_desc = dst_split->orig_desc;
 
-      const glsl_type *shared_arr_type =
-         get_shared_array_type(dst_split->desc, cmat_desc.cols * cmat_desc.rows);
-      nir_variable *shared_var = nir_variable_create(b->shader, nir_var_mem_shared,
-                                                     shared_arr_type, "mat_convert_tmp");
-      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+      nir_deref_instr *shared_deref =
+         get_shared_temp(b, info, dst_split->desc, cmat_desc.cols * cmat_desc.rows,
+                         "mat_convert_tmp");
 
       nir_def *sg_valid;
       nir_def *sgid = get_safe_sgid_box(b, nir_load_subgroup_id(b), &src_split->box,
@@ -591,11 +651,9 @@ split_cmat_transpose(nir_builder *b,
 
    if (src_split->box.wg_split) {
       struct glsl_cmat_description cmat_desc = dst_split->orig_desc;
-      const glsl_type *shared_arr_type =
-         get_shared_array_type(dst_split->desc, cmat_desc.cols * cmat_desc.rows);
-      nir_variable *shared_var = nir_variable_create(b->shader, nir_var_mem_shared,
-                                                     shared_arr_type, "mat_transpose_tmp");
-      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+      nir_deref_instr *shared_deref =
+         get_shared_temp(b, info, dst_split->desc, cmat_desc.cols * cmat_desc.rows,
+                         "mat_transpose_tmp");
 
       nir_def *sg_valid;
       nir_def *sgid = get_safe_sgid_box(b, nir_load_subgroup_id(b),
@@ -1018,7 +1076,8 @@ split_cmat_reduce_row_col_wg(nir_builder *b,
                              struct split_mat *src_split,
                              struct split_mat *dst_split,
                              const struct glsl_type *temp_type,
-                             nir_deref_instr **temp_derefs)
+                             nir_deref_instr **temp_derefs,
+                             struct split_info *info)
 {
    nir_instr *instr = &call->instr;
    nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
@@ -1084,12 +1143,8 @@ split_cmat_reduce_row_col_wg(nir_builder *b,
       int matrix_elems = src_split->desc.rows * src_split->desc.cols;
       int total_shared = num_groups * inner_total * matrix_elems;
 
-      const glsl_type *shared_arr_type =
-         get_shared_array_type(src_split->desc, total_shared);
-      nir_variable *shared_var =
-         nir_variable_create(b->shader, nir_var_mem_shared,
-                             shared_arr_type, "mat_reduce_tmp");
-      nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+      nir_deref_instr *shared_deref =
+         get_shared_temp(b, info, src_split->desc, total_shared, "mat_reduce_tmp");
 
       nir_def *sg_valid;
       nir_def *sgid_safe = get_safe_sgid_box(b, nir_load_subgroup_id(b),
@@ -1182,12 +1237,8 @@ split_cmat_reduce_row_col_wg(nir_builder *b,
       int rep_matrix_elems = src_split->desc.rows * src_split->desc.cols;
       int rep_total = num_groups * num_unique * rep_matrix_elems;
 
-      const glsl_type *rep_arr_type =
-         get_shared_array_type(src_split->desc, rep_total);
-      nir_variable *rep_var =
-         nir_variable_create(b->shader, nir_var_mem_shared,
-                             rep_arr_type, "mat_reduce_replicate");
-      nir_deref_instr *rep_deref = nir_build_deref_var(b, rep_var);
+      nir_deref_instr *rep_deref =
+         get_shared_temp(b, info, src_split->desc, rep_total, "mat_reduce_replicate");
 
       nir_def *rep_sgid = nir_load_subgroup_id(b);
       nir_def *rep_src_valid;
@@ -1308,7 +1359,8 @@ split_cmat_reduce_2x2_wg(nir_builder *b,
                          nir_function_impl *impl,
                          nir_cmat_call_instr *call,
                          struct split_mat *src_split,
-                         struct split_mat *dst_split)
+                         struct split_mat *dst_split,
+                         struct split_info *info)
 {
    nir_instr *instr = &call->instr;
    int src_inner_rows = src_split->box.inner_rows;
@@ -1319,12 +1371,8 @@ split_cmat_reduce_2x2_wg(nir_builder *b,
    int matrix_elems = src_split->desc.rows * src_split->desc.cols;
    int total_shared = src_splits * src_inner_total * matrix_elems;
 
-   const glsl_type *shared_arr_type =
-      get_shared_array_type(src_split->desc, total_shared);
-   nir_variable *shared_var =
-      nir_variable_create(b->shader, nir_var_mem_shared,
-                          shared_arr_type, "mat_reduce_2x2_tmp");
-   nir_deref_instr *shared_deref = nir_build_deref_var(b, shared_var);
+   nir_deref_instr *shared_deref =
+      get_shared_temp(b, info, src_split->desc, total_shared, "mat_reduce_2x2_tmp");
 
    nir_def *sg_valid;
    nir_def *sgid_safe = get_safe_sgid_box(b, nir_load_subgroup_id(b),
@@ -1465,7 +1513,7 @@ split_cmat_call_reduce(nir_builder *b,
       }
 
       if (src_split && src_split->box.wg_split) {
-         split_cmat_reduce_row_col_wg(b, impl, call, src_split, dst_split, temp_type, temp_derefs);
+         split_cmat_reduce_row_col_wg(b, impl, call, src_split, dst_split, temp_type, temp_derefs, info);
       } else {
          split_cmat_reduce_row_col(b, call, src_split, dst_split, temp_derefs);
       }
@@ -1478,7 +1526,7 @@ split_cmat_call_reduce(nir_builder *b,
       assert (src_split);
 
       if (src_split->box.wg_split) {
-         split_cmat_reduce_2x2_wg(b, impl, call, src_split, dst_split);
+         split_cmat_reduce_2x2_wg(b, impl, call, src_split, dst_split, info);
       } else {
          split_cmat_reduce_2x2(b, call, src_split, dst_split);
       }
@@ -1906,6 +1954,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
       .num_sg_mat_per_wg = num_sg_mat_per_wg,
       .inner_box_rows = inner_box_rows,
       .inner_box_cols = inner_box_cols,
+      .alias_shared_temps = args->alias_shared_temps,
       .m_gran = args->m_gran,
       .n_gran = args->n_gran,
       .k_gran = args->k_gran,
@@ -1920,6 +1969,7 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
    }
 
    progress = split_matrix_impl(impl, &split_info);
+   finish_shared_temp(shader, &split_info);
    _mesa_hash_table_destroy(split_mats, NULL);
    _mesa_hash_table_destroy(split_var_info, NULL);
    ralloc_free(mem_ctx);

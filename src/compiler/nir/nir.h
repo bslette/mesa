@@ -7667,6 +7667,8 @@ struct nir_lower_coopmat_args {
    unsigned m_gran;
    unsigned n_gran;
    unsigned k_gran;
+   /* Use one shared memory buffer for all temporaries */
+   bool alias_shared_temps;
 };
 
 bool nir_lower_cooperative_matrix_flexible_dimensions(nir_shader *shader,
