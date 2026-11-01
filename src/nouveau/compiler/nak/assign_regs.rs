@@ -1505,7 +1505,21 @@ impl Shader<'_> {
             let next_multiple_gprs = (total_gprs + hw_reserved_gprs)
                 .next_multiple_of(8)
                 - hw_reserved_gprs;
-            let free_gprs = next_multiple_gprs.min(max_gprs) - total_gprs;
+            let mut target_gprs = next_multiple_gprs.min(max_gprs);
+
+            // A compute shader can have more GPRs for free as long as as
+            // many workgroups still fit in the register file.  Giving RA
+            // the slack keeps it from shuffling vectors around to keep
+            // them aligned.
+            if let ShaderStageInfo::Compute(cs_info) = &self.info.stage {
+                let same = gpr_limit_for_same_occupancy(
+                    &cs_info.local_size,
+                    next_multiple_gprs + hw_reserved_gprs,
+                ) - hw_reserved_gprs;
+                target_gprs = max(target_gprs, same.min(max_gprs));
+            }
+
+            let free_gprs = target_gprs - total_gprs;
 
             total_gprs += free_gprs;
             gpr_limit += free_gprs;

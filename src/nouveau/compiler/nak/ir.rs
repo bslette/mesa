@@ -9887,6 +9887,19 @@ pub fn gpr_limit_from_local_size(local_size: &[u16; 3]) -> u32 {
     min(out, 255)
 }
 
+/// The most GPRs (including reserved ones) a workgroup of local_size can
+/// use while as many workgroups fit in the register file as with gprs
+pub fn gpr_limit_for_same_occupancy(local_size: &[u16; 3], gprs: u32) -> u32 {
+    let local_size = local_size[0] * local_size[1] * local_size[2];
+    let local_size = local_size.next_multiple_of(4 * 32) as u32;
+    let total_regs: u32 = 65536;
+
+    let wg_regs = max(gprs, 1).next_multiple_of(8) * local_size;
+    let wgs = max(total_regs / wg_regs, 1);
+    let out = prev_multiple_of(total_regs / (wgs * local_size), 8);
+    min(out, 255)
+}
+
 pub fn max_warps_per_sm(sm: &ShaderModelInfo, gprs: u32) -> u32 {
     // TODO: Take local_size and shared mem limit into account for compute
     let total_regs: u32 = 65536;
