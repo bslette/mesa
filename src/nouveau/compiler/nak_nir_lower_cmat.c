@@ -687,8 +687,13 @@ try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr)
 
    if ((desc.use != GLSL_CMAT_USE_B && layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR) ||
        (desc.use == GLSL_CMAT_USE_B && layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR)) {
-      /* Quite the pain, might not be worth it */
-      if (ldsm_count >= 4)
+      /* A row-major 16x16 B is four transposed 8x8 loads whose rows the
+       * row-major offsets below already give in the order the column-major
+       * case loads them: k 0-7 and 8-15 of columns 0-7, then of 8-15.
+       * Column-major A would need another order.  Quite the pain, might
+       * not be worth it.
+       */
+      if (ldsm_count >= 4 && desc.use != GLSL_CMAT_USE_B)
          return NULL;
 
       /* We'd need to split the rows leading to unaligned loads */
