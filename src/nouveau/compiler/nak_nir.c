@@ -1887,6 +1887,97 @@ collect_hoist_src(nir_src *src, void *data)
    return nir_foreach_src(parent, collect_hoist_src, state);
 }
 
+static bool
+is_shared_frag_sinkable(nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_alu)
+      return nir_op_is_vec_or_mov(nir_instr_as_alu(instr)->op);
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_cmat_load_shared_nv;
+}
+
+/* Whether a shared memory load can't move past instr */
+static bool
+is_shared_load_fence(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   return intr->intrinsic == nir_intrinsic_barrier ||
+          !(nir_intrinsic_infos[intr->intrinsic].flags & NIR_INTRINSIC_CAN_ELIMINATE);
+}
+
+struct first_use_state {
+   nir_block *block;
+   nir_instr *first;
+};
+
+static bool
+find_first_use(nir_def *def, void *data)
+{
+   struct first_use_state *state = data;
+   nir_foreach_use_including_if(src, def) {
+      nir_instr *user = nir_src_is_if(src) ? NULL : nir_src_use_instr(src);
+      if (!user || user->block != state->block || user->type == nir_instr_type_phi) {
+         state->first = NULL;
+         return false;
+      }
+      if (!state->first || user->index < state->first->index)
+         state->first = user;
+   }
+   return true;
+}
+
+/* The matrix lowering loads every fragment of an MMA operand from shared
+ * memory before the first MMA, which keeps the whole operand live: all of
+ * flash attention's K (or V) per subgroup.  Load each fragment, and the
+ * vectors that collect it, right before its first use instead; the
+ * scheduler moves them back up as far as registers allow.
+ */
+static bool
+nak_nir_sink_shared_cmat_loads(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         index_block_instrs(block);
+         nir_foreach_instr_reverse_safe(instr, block) {
+            if (!is_shared_frag_sinkable(instr))
+               continue;
+
+            struct first_use_state state = { .block = block };
+            nir_def *def = nir_instr_def(instr);
+            if (!find_first_use(def, &state) || !state.first)
+               continue;
+
+            nir_instr *target = state.first;
+            if (instr->type == nir_instr_type_intrinsic) {
+               for (nir_instr *i = nir_instr_next(instr); i != state.first;
+                    i = nir_instr_next(i)) {
+                  if (is_shared_load_fence(i)) {
+                     target = i;
+                     break;
+                  }
+               }
+            }
+
+            if (target == nir_instr_next(instr))
+               continue;
+
+            nir_instr_remove(instr);
+            nir_instr_insert_before(target, instr);
+            index_block_instrs(block);
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 /* Moves global loads up their block, with the address math they need, as
  * far as fences allow.  Cooperative matrix loops load the next tile right
  * after the multiplies of the previous one (see the tensor load staging);
@@ -2168,6 +2259,9 @@ nak_postprocess_nir(nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_COMPUTE &&
        nir->info.cs.has_cooperative_matrix)
       OPT(nir, nak_nir_hoist_global_loads);
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       nir->info.cs.has_cooperative_matrix)
+      OPT(nir, nak_nir_sink_shared_cmat_loads);
 
    if (nak->sm < 70) {
       const nir_split_conversions_options split_conv_opts = {
