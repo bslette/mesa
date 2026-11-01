@@ -556,11 +556,28 @@ split_cmat_convert(nir_builder *b,
    struct glsl_cmat_description conv_desc = dst_desc;
    dst_desc.use = dst_split->desc.use;
 
+   /* With only the rows split over all the subgroups, accumulators and A
+    * matrices put the same rows and columns in each subgroup and split, so
+    * changing between those uses converts each split independently too.
+    */
+   const bool same_pieces =
+      src_split->desc.use != GLSL_CMAT_USE_B && dst_split->desc.use != GLSL_CMAT_USE_B &&
+      dst_split->box.wg_split &&
+      src_split->box.inner_cols == 1 && dst_split->box.inner_cols == 1 &&
+      src_split->box.inner_rows == info->num_sg_mat_per_wg &&
+      dst_split->box.inner_rows == info->num_sg_mat_per_wg &&
+      src_split->box.outer_rows == dst_split->box.outer_rows &&
+      src_split->box.outer_cols == dst_split->box.outer_cols &&
+      src_split->desc.rows == dst_split->desc.rows &&
+      src_split->desc.cols == dst_split->desc.cols &&
+      splits == dst_splits;
+
    /* wg split will have to go via shared memory when changing use type,
     * since the data distribution across subgroups changes.
     * Same-use conversions can convert each split independently.
     */
-   if (src_split->box.wg_split && src_split->desc.use != dst_split->desc.use) {
+   if (src_split->box.wg_split && src_split->desc.use != dst_split->desc.use &&
+       !same_pieces) {
       /* allocate shared memory for whole matrix */
       struct glsl_cmat_description cmat_desc = dst_split->orig_desc;
 
