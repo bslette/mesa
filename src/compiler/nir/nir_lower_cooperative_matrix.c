@@ -1987,6 +1987,10 @@ lower_dimensions(nir_shader *shader, nir_function_impl *impl,
    unsigned num_sg_mat_per_wg = MAX2(1, shader->info.workgroup_size[0] / shader->info.min_subgroup_size);
    unsigned inner_box_cols = MIN2(num_sg_mat_per_wg, 8);
    unsigned inner_box_rows = num_sg_mat_per_wg / inner_box_cols;
+   if (args->inner_box_rows) {
+      inner_box_rows = MIN2(args->inner_box_rows, num_sg_mat_per_wg);
+      inner_box_cols = num_sg_mat_per_wg / inner_box_rows;
+   }
 
    struct split_info split_info = {
       .split_var_info = split_var_info,

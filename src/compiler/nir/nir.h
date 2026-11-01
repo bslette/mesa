@@ -7674,6 +7674,11 @@ struct nir_lower_coopmat_args {
     * the workgroup before each use.
     */
    nir_variable *shared_temp;
+   /* How many subgroups of a workgroup scope split go down the rows of a
+    * matrix, at most the number of subgroups; 0 picks it.  Rows are
+    * otherwise filled last, so every subgroup has all rows of A.
+    */
+   unsigned inner_box_rows;
 };
 
 bool nir_lower_cooperative_matrix_flexible_dimensions(nir_shader *shader,
