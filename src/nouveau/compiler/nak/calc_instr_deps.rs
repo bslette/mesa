@@ -8,7 +8,7 @@ use crate::reg_tracker::{RegRefIterable, RegTracker, SparseRegTracker};
 
 use compiler::dataflow::{BackwardDataflow, ForwardDataflow};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cmp::max;
+use std::cmp::{max, min};
 use std::hash::Hash;
 use std::ops::Range;
 use std::slice;
@@ -227,6 +227,10 @@ impl DepGraph {
         debug_assert!(self.active.is_empty());
     }
 
+    pub fn first_wait(&self, dep: usize) -> (usize, usize) {
+        self.deps[dep].first_wait.unwrap()
+    }
+
     pub fn dep_is_waited_after(
         &self,
         dep: usize,
@@ -257,52 +261,80 @@ impl DepGraph {
     }
 }
 
+/// Scoreboard barriers.  A barrier counts all the instructions signaling it,
+/// so several dependencies can share one: waiting on any of them then waits
+/// on all of them.
 struct BarAlloc {
     num_bars: u8,
-    bar_dep: [usize; 6],
+    bar_deps: [Vec<usize>; 6],
+    /// The earliest first wait of a dependency on each barrier
+    bar_wait: [(usize, usize); 6],
 }
 
 impl BarAlloc {
     pub fn new() -> BarAlloc {
         BarAlloc {
             num_bars: 6,
-            bar_dep: [usize::MAX; 6],
+            bar_deps: Default::default(),
+            bar_wait: [(usize::MAX, usize::MAX); 6],
         }
     }
 
     pub fn bar_is_free(&self, bar: u8) -> bool {
         debug_assert!(bar < self.num_bars);
-        self.bar_dep[usize::from(bar)] == usize::MAX
+        self.bar_deps[usize::from(bar)].is_empty()
     }
 
-    pub fn set_bar_dep(&mut self, bar: u8, dep: usize) {
-        debug_assert!(self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = dep;
+    pub fn add_bar_dep(&mut self, bar: u8, dep: usize, wait: (usize, usize)) {
+        let b = usize::from(bar);
+        self.bar_deps[b].push(dep);
+        self.bar_wait[b] = min(self.bar_wait[b], wait);
     }
 
     pub fn free_bar(&mut self, bar: u8) {
         debug_assert!(!self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = usize::MAX;
+        self.bar_deps[usize::from(bar)].clear();
+        self.bar_wait[usize::from(bar)] = (usize::MAX, usize::MAX);
     }
 
     pub fn try_find_free_bar(&self) -> Option<u8> {
         (0..self.num_bars).find(|&bar| self.bar_is_free(bar))
     }
 
-    pub fn free_some_bar(&mut self) -> u8 {
-        // Get the oldest by looking for the one with the smallest dep
-        let mut bar = 0;
-        for b in 1..self.num_bars {
-            if self.bar_dep[usize::from(b)] < self.bar_dep[usize::from(bar)] {
-                bar = b;
+    /// The barrier (other than except) to share with a dependency first
+    /// waited on at wait: the one waited on soonest after that, or else the
+    /// one waited on last.  That waits on as little as possible too early,
+    /// where taking a barrier over used to wait on its dependency right away.
+    pub fn pick_shared_bar_except(
+        &self,
+        wait: (usize, usize),
+        except: Option<u8>,
+    ) -> u8 {
+        let mut best: Option<u8> = None;
+        for bar in 0..self.num_bars {
+            if Some(bar) == except {
+                continue;
             }
+            let bw = self.bar_wait[usize::from(bar)];
+            best = match best {
+                None => Some(bar),
+                Some(b) => {
+                    let cw = self.bar_wait[usize::from(b)];
+                    let better = if bw >= wait {
+                        cw < wait || bw < cw
+                    } else {
+                        cw < wait && bw > cw
+                    };
+                    Some(if better { bar } else { b })
+                }
+            };
         }
-        self.free_bar(bar);
-        bar
+        best.unwrap()
     }
 
     pub fn get_bar_for_dep(&self, dep: usize) -> Option<u8> {
-        (0..self.num_bars).find(|&bar| self.bar_dep[usize::from(bar)] == dep)
+        (0..self.num_bars)
+            .find(|&bar| self.bar_deps[usize::from(bar)].contains(&dep))
     }
 }
 
@@ -723,21 +755,19 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
 
             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
             if deps.dep_is_waited_after(rd_dep, bi, ip) {
-                let rd_bar = bars.try_find_free_bar().unwrap_or_else(|| {
-                    let bar = bars.free_some_bar();
-                    instr.deps.add_wt_bar(bar);
-                    bar
-                });
-                bars.set_bar_dep(rd_bar, rd_dep);
+                let wait = deps.first_wait(rd_dep);
+                let rd_bar = bars
+                    .try_find_free_bar()
+                    .unwrap_or_else(|| bars.pick_shared_bar_except(wait, None));
+                bars.add_bar_dep(rd_bar, rd_dep, wait);
                 instr.deps.set_rd_bar(rd_bar);
             }
             if deps.dep_is_waited_after(wr_dep, bi, ip) {
+                let wait = deps.first_wait(wr_dep);
                 let wr_bar = bars.try_find_free_bar().unwrap_or_else(|| {
-                    let bar = bars.free_some_bar();
-                    instr.deps.add_wt_bar(bar);
-                    bar
+                    bars.pick_shared_bar_except(wait, instr.deps.rd_bar())
                 });
-                bars.set_bar_dep(wr_bar, wr_dep);
+                bars.add_bar_dep(wr_bar, wr_dep, wait);
                 instr.deps.set_wr_bar(wr_bar);
             }
         }
