@@ -1729,6 +1729,169 @@ nak_lower_nir_before_linking(nir_shader *nir, const struct nak_compiler *nak)
    }
 }
 
+static bool
+is_global_load(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_global_nv:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Instructions that may come along with a global load we move up */
+static bool
+can_move_with_global_load(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu:
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      return is_global_load(instr) ||
+             (nir_intrinsic_infos[intr->intrinsic].flags & NIR_INTRINSIC_CAN_REORDER);
+   }
+   default:
+      return false;
+   }
+}
+
+/* Instructions global loads can't move above: anything that synchronizes or
+ * may write memory other than shared memory.
+ */
+static bool
+is_global_load_fence(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_call:
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_barrier:
+         return true;
+      case nir_intrinsic_store_shared:
+      case nir_intrinsic_store_shared_nv:
+         return false;
+      default:
+         return !(nir_intrinsic_infos[intr->intrinsic].flags &
+                  NIR_INTRINSIC_CAN_ELIMINATE);
+      }
+   }
+   default:
+      return false;
+   }
+}
+
+/* Instruction indices only need to be ordered within the block */
+static void
+index_block_instrs(nir_block *block)
+{
+   nir_instr *first = nir_block_first_instr(block);
+   unsigned index = first ? first->index : 0;
+   nir_foreach_instr(instr, block)
+      instr->index = index++;
+}
+
+struct hoist_state {
+   nir_instr *fence;
+   struct set *moving;
+   bool ok;
+};
+
+static bool
+collect_hoist_src(nir_src *src, void *data)
+{
+   struct hoist_state *state = data;
+   nir_instr *parent = nir_def_instr(src->ssa);
+   if (parent->block != state->fence->block ||
+       parent->index <= state->fence->index ||
+       _mesa_set_search(state->moving, parent))
+      return true;
+
+   if (!can_move_with_global_load(parent)) {
+      state->ok = false;
+      return false;
+   }
+   _mesa_set_add(state->moving, parent);
+   return nir_foreach_src(parent, collect_hoist_src, state);
+}
+
+/* Moves global loads up their block, with the address math they need, as
+ * far as fences allow.  Cooperative matrix loops load the next tile right
+ * after the multiplies of the previous one (see the tensor load staging);
+ * this lets those loads start before the multiplies.  It costs registers,
+ * so it's only for those shaders.
+ */
+static bool
+nak_nir_hoist_global_loads(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_index_instrs(impl);
+      nir_foreach_block(block, impl) {
+         /* Hoisted loads keep their order after the fence */
+         nir_instr *fence = NULL, *ins = NULL;
+         nir_foreach_instr_safe(instr, block) {
+            if (is_global_load_fence(instr)) {
+               fence = ins = instr;
+               continue;
+            }
+            if (!fence || !is_global_load(instr))
+               continue;
+
+            struct hoist_state state = {
+               .fence = ins,
+               .moving = _mesa_pointer_set_create(NULL),
+               .ok = true,
+            };
+            nir_foreach_src(instr, collect_hoist_src, &state);
+
+            /* Only worth it if something the load doesn't need is between */
+            bool worth = false;
+            for (nir_instr *i = nir_instr_next(ins); i != instr; i = nir_instr_next(i)) {
+               if (!_mesa_set_search(state.moving, i) &&
+                   i->type == nir_instr_type_intrinsic) {
+                  worth = true;
+                  break;
+               }
+            }
+
+            if (state.ok && worth) {
+               nir_instr *pos = ins;
+               nir_instr *next;
+               for (nir_instr *i = nir_instr_next(ins); i != instr; i = next) {
+                  next = nir_instr_next(i);
+                  if (!_mesa_set_search(state.moving, i))
+                     continue;
+                  nir_instr_remove(i);
+                  nir_instr_insert_after(pos, i);
+                  pos = i;
+               }
+               nir_instr_remove(instr);
+               nir_instr_insert_after(pos, instr);
+               ins = instr;
+               index_block_instrs(block);
+               impl_progress = true;
+            }
+            _mesa_set_destroy(state.moving, NULL);
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 void
 nak_postprocess_nir(nir_shader *nir,
                     const struct nak_compiler *nak,
@@ -1940,6 +2103,9 @@ nak_postprocess_nir(nir_shader *nir,
    } while (progress);
 
    OPT(nir, nir_opt_move, nir_move_comparisons | nir_move_load_ubo);
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       nir->info.cs.has_cooperative_matrix)
+      OPT(nir, nak_nir_hoist_global_loads);
 
    if (nak->sm < 70) {
       const nir_split_conversions_options split_conv_opts = {
