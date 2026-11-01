@@ -1085,6 +1085,24 @@ split_cmat_reduce_row_col(nir_builder *b,
       }
    }
 
+   /* Reduce what each group of splits combined into */
+   if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) == (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN) ||
+       src_splits == 1) {
+      b->cursor = nir_before_instr(instr);
+      call_reduce(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def);
+   } else if (reduce & NIR_CMAT_REDUCE_ROW) {
+      for (unsigned r = 0; r < src_split->box.outer_rows; r++) {
+         b->cursor = nir_before_instr(instr);
+         call_reduce(b, call, reduce, &temp_derefs[r * src_split->box.outer_cols]->def,
+                     &temp_derefs[r * src_split->box.outer_cols]->def);
+      }
+   } else {
+      for (unsigned c = 0; c < src_split->box.outer_cols; c++) {
+         b->cursor = nir_before_instr(instr);
+         call_reduce(b, call, reduce, &temp_derefs[c]->def, &temp_derefs[c]->def);
+      }
+   }
+
    /* at this point temp_derefs should contain all the split reduced src matrices
       now to store them */
    if (dst_split) {
@@ -1170,6 +1188,11 @@ split_cmat_reduce_row_col_wg(nir_builder *b,
                                &temp_derefs[c + r * outer_cols]->def);
          }
       }
+   }
+
+   for (int g = 0; g < num_groups; g++) {
+      b->cursor = nir_before_instr(instr);
+      call_reduce(b, call, reduce, &group_derefs[g]->def, &group_derefs[g]->def);
    }
 
    /* Phase 2: Exchange across inner subgroups via shared memory */
@@ -1546,13 +1569,15 @@ split_cmat_call_reduce(nir_builder *b,
          temp_derefs[i] = nir_build_deref_var(b, temp_var);
       }
 
-      /* reduce each individual src matrix */
+      /* The splits are combined element by element first and reduced once
+       * per group after, which saves each split its own shuffles.
+       */
       for (unsigned i = 0; i < src_splits; i++) {
          nir_deref_instr *src_deref = src_split ?
             recreate_derefs(b, &call->params[1], src_split->split_vars[i]) :
             nir_src_as_deref(call->params[1]);
          b->cursor = nir_before_instr(instr);
-         call_reduce(b, call, reduce, &temp_derefs[i]->def, &src_deref->def);
+         nir_cmat_copy(b, &temp_derefs[i]->def, &src_deref->def);
       }
 
       if (src_split && src_split->box.wg_split) {
