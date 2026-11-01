@@ -1943,10 +1943,24 @@ struct stage_layout {
    enum glsl_matrix_layout layout;
 };
 
-static struct stage_layout
-get_stage_layout(const struct glsl_cmat_description desc)
+static struct glsl_cmat_description
+stage_call_desc(nir_cmat_call_instr *call)
 {
-   const bool col_major = desc.use == GLSL_CMAT_USE_B;
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   return *glsl_get_cmat_description(dst->type);
+}
+
+static struct stage_layout
+get_stage_layout(nir_cmat_call_instr *call)
+{
+   /* B goes column-major when the tensor is read transposed, as for
+    * K^T and the B of matmuls, and otherwise row-major like the tensor
+    * (LDSM transposes either way), so that fills can copy whole rows.
+    */
+   const struct glsl_cmat_description desc = stage_call_desc(call);
+   const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+   const bool transposed = tl.tensor_view && tl.view_permutations[0] == 1;
+   const bool col_major = desc.use == GLSL_CMAT_USE_B && transposed;
    return (struct stage_layout) {
       .col_major = col_major,
       .inner = col_major ? desc.rows : desc.cols,
@@ -1958,17 +1972,10 @@ get_stage_layout(const struct glsl_cmat_description desc)
 }
 
 static unsigned
-staged_tile_elems(const struct glsl_cmat_description desc)
+staged_tile_elems(nir_cmat_call_instr *call)
 {
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(call);
    return l.outer * l.stride;
-}
-
-static struct glsl_cmat_description
-stage_call_desc(nir_cmat_call_instr *call)
-{
-   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
-   return *glsl_get_cmat_description(dst->type);
 }
 
 static void
@@ -2012,7 +2019,7 @@ stage_load_init(nir_builder *b, struct stage_load *sl, nir_cmat_call_instr *call
 {
    const struct glsl_cmat_description desc = stage_call_desc(call);
    const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(call);
 
    memset(sl, 0, sizeof(*sl));
    sl->call = call;
@@ -2046,7 +2053,7 @@ stage_fill_fast_loads(nir_builder *b, struct stage_load *sl, nir_def *ok,
 {
    const struct glsl_cmat_description desc = stage_call_desc(sl->call);
    const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(sl->call);
    const unsigned vec = 16 / elem_bytes;
    const unsigned row_vecs = l.inner / vec;
    const unsigned total_vecs = l.inner * l.outer / vec;
@@ -2074,7 +2081,7 @@ stage_fill_fast_stores(nir_builder *b, struct stage_load *sl, nir_variable *tile
 {
    const struct glsl_cmat_description desc = stage_call_desc(sl->call);
    const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(sl->call);
    const unsigned vec = 16 / elem_bytes;
    const unsigned row_vecs = l.inner / vec;
    const unsigned total_vecs = l.inner * l.outer / vec;
@@ -2133,7 +2140,7 @@ stage_fill_generic_iter(nir_builder *b, struct stage_load *sl,
    const struct glsl_cmat_description desc = stage_call_desc(sl->call);
    const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
    const unsigned elem_bytes = bit_size / 8;
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(sl->call);
    struct nir_calc_tensor_info *info = it->info;
    nir_deref_instr *base = it->base;
    nir_variable *tile = it->tile;
@@ -2241,7 +2248,7 @@ stage_generic_plan_init(nir_builder *b, struct stage_load *sl, nir_variable *til
 {
    const struct glsl_cmat_description desc = stage_call_desc(sl->call);
    const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(sl->call);
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(sl->call);
    const unsigned total = l.inner * l.outer;
    struct nir_calc_tensor_info *info = &sl->info;
 
@@ -2320,7 +2327,7 @@ stage_fill_generic(nir_builder *b, struct stage_load *sl, nir_variable *tile,
    nir_cmat_call_instr *call = sl->call;
    const struct glsl_cmat_description desc = stage_call_desc(call);
    const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(sl->call);
 
    /* Clipped elements come from the clip matrix.  Put it in the tile first
     * unless the view can't clip.
@@ -2382,7 +2389,7 @@ static void
 stage_load_from_tile(nir_builder *b, nir_cmat_call_instr *call,
                      nir_variable *tile, unsigned offset)
 {
-   const struct stage_layout l = get_stage_layout(stage_call_desc(call));
+   const struct stage_layout l = get_stage_layout(call);
    nir_cmat_load(b, call->params[0].ssa,
                  &stage_tile_ptr(b, tile, nir_imm_int(b, offset))->def,
                  nir_imm_int(b, l.stride), .matrix_layout = l.layout);
@@ -2395,7 +2402,7 @@ can_stage_tensor_load(nir_cmat_call_instr *call)
       return false;
 
    const struct glsl_cmat_description desc = stage_call_desc(call);
-   const struct stage_layout l = get_stage_layout(desc);
+   const struct stage_layout l = get_stage_layout(call);
 
    return desc.scope == SCOPE_WORKGROUP &&
           desc.use != GLSL_CMAT_USE_ACCUMULATOR &&
@@ -2591,12 +2598,12 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, const struct nak_compiler *nak,
    unsigned max_bytes = 0;
    for (unsigned i = 0; i < num_cands; i++) {
       const struct glsl_cmat_description desc = stage_call_desc(cand[i]);
-      const unsigned bytes = staged_tile_elems(desc) * 2;
+      const unsigned bytes = staged_tile_elems(cand[i]) * 2;
       const bool dup = desc.use == GLSL_CMAT_USE_A ? box_cols > 1 : box_rows > 1;
 
       if (i + 1 < num_cands) {
          const unsigned pair_bytes =
-            bytes + staged_tile_elems(stage_call_desc(cand[i + 1])) * 2;
+            bytes + staged_tile_elems(cand[i + 1]) * 2;
          struct stage_group g = { { cand[i], cand[i + 1] }, 2 };
          if (pair_bytes <= budget &&
              can_defer_stage(cand[i], cand[i + 1], g.copies, &g.num_copies)) {
@@ -2647,7 +2654,7 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, const struct nak_compiler *nak,
    util_dynarray_foreach(&groups, struct stage_group, g) {
       unsigned offsets[2] = { 0, 0 };
       if (g->count > 1)
-         offsets[1] = staged_tile_elems(stage_call_desc(g->calls[0]));
+         offsets[1] = staged_tile_elems(g->calls[0]);
 
       /* Everything goes in one place, after the last load, when the earlier
        * ones can move there.  Then one branch picks the fast path for all of
