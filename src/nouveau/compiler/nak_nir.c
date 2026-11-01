@@ -429,7 +429,7 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
 
    if (nak_nir_has_flexible_cmat(nir)) {
       nir_variable *stage_tile;
-      OPT(nir, nak_nir_stage_cmat_tensor_loads, &stage_tile);
+      OPT(nir, nak_nir_stage_cmat_tensor_loads, nak, &stage_tile);
 
       /* M16N8K16 is the native MMA, our 16x16 accumulators are two of them */
       const struct nir_lower_coopmat_args coopmat_args = {

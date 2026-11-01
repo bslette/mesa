@@ -5,6 +5,7 @@
  */
 
 #include "util/macros.h"
+#include "util/set.h"
 #include "util/u_dynarray.h"
 #include "glsl_types.h"
 #include "nak_private.h"
@@ -1344,6 +1345,8 @@ struct fast_tensor {
    nir_def *ok;
    nir_def *addr;
    nir_def *stride;
+   /* 16-byte aligned and readable, for loads made whether or not ok */
+   nir_def *safe_addr;
    enum gl_access_qualifier access;
 };
 
@@ -1400,8 +1403,21 @@ fast_tensor_init(nir_builder *b, const struct nir_calc_tensor_info *info,
    }
 
    nir_def *elem = nir_iadd(b, nir_imul(b, off0, stride), off1);
-   nir_def *addr = nir_deref_buffer_address(b, 1, 64, &deref->def);
-   addr = nir_iadd(b, addr, nir_imul_imm(b, nir_u2u64(b, elem), elem_bytes));
+   nir_def *base_addr = nir_deref_buffer_address(b, 1, 64, &deref->def);
+   nir_def *addr = nir_iadd(b, base_addr,
+                            nir_imul_imm(b, nir_u2u64(b, elem), elem_bytes));
+
+   /* The start of the array the tensor is in is there even when the tensor
+    * itself is all clamped away, and the 16 bytes around it are in the same
+    * page.
+    */
+   nir_def *safe_addr = base_addr;
+   if (deref->deref_type == nir_deref_type_array) {
+      nir_deref_instr *start =
+         nir_build_deref_array_imm(b, nir_deref_instr_parent(deref), 0);
+      safe_addr = nir_deref_buffer_address(b, 1, 64, &start->def);
+   }
+   ft->safe_addr = nir_iand_imm(b, safe_addr, ~(uint64_t)15);
 
    if (align_elems > 1) {
       nir_def *misaligned =
@@ -1895,8 +1911,21 @@ nak_nir_lower_cmat(nir_shader *nir, const struct nak_compiler *nak)
    return progress;
 }
 
-/* NVK's maxComputeSharedMemorySize */
-#define NAK_CMAT_MAX_SHARED_BYTES (48 * 1024)
+/* The shared memory a workgroup can have, which is more than NVK lets the
+ * shader itself declare (maxComputeSharedMemorySize is 48 KiB).
+ */
+static unsigned
+nak_cmat_max_shared_bytes(const struct nak_compiler *nak)
+{
+   /* nak_shader_info::cs.smem_size is 16 bits */
+   const unsigned info_max = 0xff00;
+   if (nak->sm >= 80)
+      return MIN2(info_max, 96 * 1024); /* of 100 KiB per SM */
+   else if (nak->sm >= 75)
+      return MIN2(info_max, 64 * 1024);
+   else
+      return MIN2(info_max, 96 * 1024);
+}
 
 /* Pad rows (columns for B) by 16 bytes so that the eight 16-byte rows an
  * LDSM reads land in different banks.
@@ -1962,125 +1991,154 @@ stage_tile_ptr(nir_builder *b, nir_variable *tile, nir_def *offset)
                                        nir_u2uN(b, offset, deref->def.bit_size));
 }
 
-/* Fills elements [offset, offset + staged_tile_elems) of the tile with the
- * matrix call loads.
+/* Most 16-byte loads per invocation in a fast fill */
+#define STAGE_MAX_FAST_LOADS 64
+
+/* One tensor load the staging pass handles: either filled into the tile, or
+ * (direct) loaded from memory into the matrix as usual.
  */
+struct stage_load {
+   nir_cmat_call_instr *call;
+   struct nir_calc_tensor_info info;
+   nir_deref_instr *base;
+   struct fast_tensor ft;
+   bool fast;
+   unsigned offset;
+};
+
 static void
-stage_fill(nir_builder *b, nir_cmat_call_instr *call, nir_variable *tile,
-           unsigned offset, unsigned wg_size)
+stage_load_init(nir_builder *b, struct stage_load *sl, nir_cmat_call_instr *call,
+                unsigned offset, bool direct, unsigned wg_size)
 {
    const struct glsl_cmat_description desc = stage_call_desc(call);
-   const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
-   const unsigned elem_bytes = bit_size / 8;
-   const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+   const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
    const struct stage_layout l = get_stage_layout(desc);
-   const unsigned total = l.inner * l.outer;
 
-   struct nir_calc_tensor_info info = { 0 };
-   nir_calc_tensor_derefs_init(b, &info, call);
+   memset(sl, 0, sizeof(*sl));
+   sl->call = call;
+   sl->offset = offset;
+   nir_calc_tensor_derefs_init(b, &sl->info, call);
+   sl->base = tensor_load_base(b, &sl->info, nir_src_as_deref(call->params[1]),
+                               elem_bytes * 8);
 
-   /* Clipped elements come from the clip matrix.  Put it in the tile first
-    * unless the view can't clip.
+   /* 16-byte accesses: along the inner dimension of the tile for fills,
+    * and whatever cmat_load assumes for direct loads.
     */
-   if (tl.tensor_view) {
-      nir_def *no_clip =
-         nir_iand(b, nir_iand(b, nir_ieq_imm(b, info.clip_row_offset, 0),
-                                 nir_ieq_imm(b, info.clip_col_offset, 0)),
-                     nir_iand(b, nir_uge_imm(b, info.clip_row_span, desc.rows),
-                                 nir_uge_imm(b, info.clip_col_span, desc.cols)));
-      nir_push_if(b, nir_inot(b, no_clip));
-      nir_cmat_store(b, &stage_tile_ptr(b, tile, nir_imm_int(b, offset))->def,
-                     call->params[4].ssa, nir_imm_int(b, l.stride),
-                     .matrix_layout = l.layout);
-      stage_barrier(b);
-      nir_pop_if(b, NULL);
+   const unsigned vec = 16 / elem_bytes;
+   if (direct) {
+      sl->fast = fast_tensor_init(b, &sl->info, sl->base, desc.rows, desc.cols,
+                                  elem_bytes, vec, &sl->ft);
+   } else {
+      sl->fast = l.inner % vec == 0 &&
+                 DIV_ROUND_UP(l.inner * l.outer / vec, wg_size) <= STAGE_MAX_FAST_LOADS &&
+                 fast_tensor_init(b, &sl->info, sl->base, desc.rows, desc.cols,
+                                  elem_bytes, vec, &sl->ft) &&
+                 sl->ft.transpose == l.col_major;
    }
+}
 
-   nir_deref_instr *base = tensor_load_base(b, &info,
-                                            nir_src_as_deref(call->params[1]),
-                                            bit_size);
+/* The 16-byte loads of a fast fill.  They are made whatever ok is, from a
+ * safe address when it's false, so that they need no branch.
+ */
+static void
+stage_fill_fast_loads(nir_builder *b, struct stage_load *sl, nir_def *ok,
+                      unsigned wg_size, nir_def **vals)
+{
+   const struct glsl_cmat_description desc = stage_call_desc(sl->call);
+   const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
+   const struct stage_layout l = get_stage_layout(desc);
+   const unsigned vec = 16 / elem_bytes;
+   const unsigned row_vecs = l.inner / vec;
+   const unsigned total_vecs = l.inner * l.outer / vec;
    nir_def *li = nir_load_local_invocation_index(b);
 
-   /* 16-byte loads and stores when the inner dimension is contiguous */
+   for (unsigned v0 = 0, n = 0; v0 < total_vecs; v0 += wg_size, n++) {
+      nir_def *v = nir_iadd_imm(b, li, v0);
+      if (v0 + wg_size > total_vecs)
+         v = nir_umin(b, v, nir_imm_int(b, total_vecs - 1));
+
+      nir_def *in_vec = nir_iand_imm(b, v, row_vecs - 1);
+      nir_def *out = nir_ushr_imm(b, v, util_logbase2(row_vecs));
+      nir_def *in = nir_imul_imm(b, in_vec, vec);
+      nir_def *addr = fast_tensor_addr(b, &sl->ft, l.col_major ? in : out,
+                                       l.col_major ? out : in, elem_bytes);
+      addr = nir_bcsel(b, ok, addr, sl->ft.safe_addr);
+      vals[n] = nir_load_global(b, 4, 32, addr, .align_mul = 16,
+                                .access = sl->ft.access);
+   }
+}
+
+static void
+stage_fill_fast_stores(nir_builder *b, struct stage_load *sl, nir_variable *tile,
+                       unsigned wg_size, nir_def **vals)
+{
+   const struct glsl_cmat_description desc = stage_call_desc(sl->call);
+   const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
+   const struct stage_layout l = get_stage_layout(desc);
    const unsigned vec = 16 / elem_bytes;
-   struct fast_tensor ft;
-   nir_if *fast_if = NULL;
-   if (l.inner % vec == 0 &&
-       fast_tensor_init(b, &info, base, desc.rows, desc.cols, elem_bytes, vec,
-                        &ft) &&
-       ft.transpose == l.col_major) {
-      fast_if = nir_push_if(b, ft.ok);
+   const unsigned row_vecs = l.inner / vec;
+   const unsigned total_vecs = l.inner * l.outer / vec;
+   nir_def *li = nir_load_local_invocation_index(b);
 
-      nir_deref_instr *tile_vec = nir_build_deref_var(b, tile);
-      tile_vec = nir_build_deref_cast_with_alignment(b, &tile_vec->def,
-                                                     nir_var_mem_shared,
-                                                     glsl_uvec4_type(), 16, 16, 0);
+   nir_deref_instr *tile_vec = nir_build_deref_var(b, tile);
+   tile_vec = nir_build_deref_cast_with_alignment(b, &tile_vec->def,
+                                                  nir_var_mem_shared,
+                                                  glsl_uvec4_type(), 16, 16, 0);
 
-      const unsigned row_vecs = l.inner / vec;
-      const unsigned total_vecs = total / vec;
-      for (unsigned v0 = 0; v0 < total_vecs; v0 += wg_size) {
-         nir_def *v = nir_iadd_imm(b, li, v0);
-         nir_if *tail = NULL;
-         if (v0 + wg_size > total_vecs)
-            tail = nir_push_if(b, nir_ult_imm(b, v, total_vecs));
+   for (unsigned v0 = 0, n = 0; v0 < total_vecs; v0 += wg_size, n++) {
+      nir_def *v = nir_iadd_imm(b, li, v0);
+      nir_if *tail = NULL;
+      if (v0 + wg_size > total_vecs)
+         tail = nir_push_if(b, nir_ult_imm(b, v, total_vecs));
 
-         nir_def *in_vec = nir_iand_imm(b, v, row_vecs - 1);
-         nir_def *out = nir_ushr_imm(b, v, util_logbase2(row_vecs));
-         nir_def *in = nir_imul_imm(b, in_vec, vec);
-         nir_def *addr = fast_tensor_addr(b, &ft, l.col_major ? in : out,
-                                          l.col_major ? out : in, elem_bytes);
-         nir_def *val = nir_load_global(b, 4, 32, addr, .align_mul = 16,
-                                        .access = ft.access);
+      nir_def *in_vec = nir_iand_imm(b, v, row_vecs - 1);
+      nir_def *out = nir_ushr_imm(b, v, util_logbase2(row_vecs));
+      nir_def *idx = nir_iadd(b, nir_imul_imm(b, out, l.stride / vec), in_vec);
+      idx = nir_iadd_imm(b, idx, sl->offset / vec);
+      nir_store_deref(b, nir_build_deref_ptr_as_array(b, tile_vec,
+                            nir_u2uN(b, idx, tile_vec->def.bit_size)),
+                      vals[n], 0xf);
 
-         nir_def *idx = nir_iadd(b, nir_imul_imm(b, out, l.stride / vec), in_vec);
-         idx = nir_iadd_imm(b, idx, offset / vec);
-         nir_store_deref(b, nir_build_deref_ptr_as_array(b, tile_vec,
-                               nir_u2uN(b, idx, tile_vec->def.bit_size)),
-                         val, 0xf);
-
-         if (tail)
-            nir_pop_if(b, tail);
-      }
-
-      nir_push_else(b, fast_if);
+      if (tail)
+         nir_pop_if(b, tail);
    }
+}
 
-   /* Anything else goes element by element, or by decode vector when the
-    * vector runs along the inner dimension.
-    */
-   unsigned run = l.inner % 8 == 0 ? 8 : 1;
-   bool vec_decode = false;
-   if (info.decode_vec_fnptr) {
-      const bool transposed = info.view && info.view_permutations[0] == 1;
-      const unsigned width = glsl_get_vector_elements(
-         glsl_get_bare_type(info.decode_vec_fnptr->params[0].type));
-      if (!info.view_has_dims && transposed == l.col_major &&
-          width > 1 && width <= 8 && l.inner % width == 0) {
-         run = width;
-         vec_decode = true;
-      }
-   }
+struct stage_generic_iter {
+   struct nir_calc_tensor_info *info;
+   nir_deref_instr *base;
+   nir_variable *tile;
+   nir_def *li;
+   unsigned wg_size;
+   unsigned offset;
+   unsigned run;
+   unsigned unroll;
+   unsigned runs;
+   bool exact;
+   bool vec_decode;
+};
 
-   /* Each invocation handles per_inv runs, about 8 elements of them per
-    * iteration so that their loads overlap without running out of
-    * registers.  The trip count is the same everywhere.
-    */
-   const unsigned runs = total / run;
-   const unsigned per_inv = DIV_ROUND_UP(runs, wg_size);
-   const unsigned unroll = MIN2(per_inv, MAX2(1, 8 / run));
-   const unsigned iters = DIV_ROUND_UP(per_inv, unroll);
-   const bool exact = runs % (wg_size * unroll) == 0;
-
-   nir_variable *j_var = NULL;
-   nir_loop *loop = NULL;
-   nir_def *j = nir_imm_int(b, 0);
-   if (iters > 1) {
-      j_var = nir_local_variable_create(b->impl, glsl_uint_type(), "cmat_stage_j");
-      nir_store_var(b, j_var, j, 1);
-      loop = nir_push_loop(b);
-      j = nir_load_var(b, j_var);
-      nir_break_if(b, nir_uge_imm(b, j, iters));
-   }
+/* One iteration of a generic fill: unroll runs of run elements each.  With
+ * vals_out it only computes their values, and with vals_in it only stores
+ * them, counting them in *n.
+ */
+static void
+stage_fill_generic_iter(nir_builder *b, struct stage_load *sl,
+                        const struct stage_generic_iter *it, nir_def *j,
+                        nir_def **vals_out, nir_def *const *vals_in,
+                        unsigned *n)
+{
+   const struct glsl_cmat_description desc = stage_call_desc(sl->call);
+   const unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
+   const unsigned elem_bytes = bit_size / 8;
+   const struct stage_layout l = get_stage_layout(desc);
+   struct nir_calc_tensor_info *info = it->info;
+   nir_deref_instr *base = it->base;
+   nir_variable *tile = it->tile;
+   nir_def *li = it->li;
+   const unsigned wg_size = it->wg_size, offset = it->offset, run = it->run;
+   const unsigned unroll = it->unroll, runs = it->runs;
+   const bool exact = it->exact, vec_decode = it->vec_decode;
 
    for (unsigned u = 0; u < unroll; u++) {
       nir_def *r = nir_iadd(b, li, nir_imul_imm(b, nir_iadd_imm(b, nir_imul_imm(b, j, unroll), u),
@@ -2100,15 +2158,20 @@ stage_fill(nir_builder *b, nir_cmat_call_instr *call, nir_variable *tile,
          nir_build_deref_cast_with_alignment(b, &dst->def, nir_var_mem_shared,
                                              glsl_vector_type(desc.element_type, run),
                                              run * elem_bytes, run * elem_bytes, 0);
-      if (vec_decode) {
+      if (vals_in) {
+         nir_store_deref(b, vec_dst, vals_in[(*n)++], nir_component_mask(run));
+      } else if (vec_decode) {
          nir_deref_instr *iter_deref = base;
-         info.use_vec_decode = true;
-         nir_def *val = nir_calc_tensor_derefs(b, &info, row, col, &iter_deref);
-         info.use_vec_decode = false;
-         nir_store_deref(b, vec_dst, val, nir_component_mask(run));
-         if (info.clipped_if) {
-            nir_pop_if(b, info.clipped_if);
-            info.clipped_if = NULL;
+         info->use_vec_decode = true;
+         nir_def *val = nir_calc_tensor_derefs(b, info, row, col, &iter_deref);
+         info->use_vec_decode = false;
+         if (vals_out)
+            vals_out[(*n)++] = val;
+         else
+            nir_store_deref(b, vec_dst, val, nir_component_mask(run));
+         if (info->clipped_if) {
+            nir_pop_if(b, info->clipped_if);
+            info->clipped_if = NULL;
          }
       } else {
          /* Consecutive elements mostly share a block, which lets the
@@ -2118,30 +2181,176 @@ stage_fill(nir_builder *b, nir_cmat_call_instr *call, nir_variable *tile,
          for (unsigned k = 0; k < run; k++) {
             nir_def *k_row = l.col_major ? nir_iadd_imm(b, row, k) : row;
             nir_def *k_col = l.col_major ? col : nir_iadd_imm(b, col, k);
-            vals[k] = tensor_load_elem(b, &info, base, k_row, k_col, bit_size);
-            if (info.clipped_if) {
+            vals[k] = tensor_load_elem(b, info, base, k_row, k_col, bit_size);
+            if (info->clipped_if) {
                nir_store_deref(b, nir_build_deref_ptr_as_array(b, dst,
                                      nir_imm_intN_t(b, k, dst->def.bit_size)),
                                vals[k], 1);
-               nir_pop_if(b, info.clipped_if);
-               info.clipped_if = NULL;
+               nir_pop_if(b, info->clipped_if);
+               info->clipped_if = NULL;
                vals[k] = NULL;
             }
          }
-         if (vals[0])
+         if (vals_out)
+            vals_out[(*n)++] = nir_vec(b, vals, run);
+         else if (vals[0])
             nir_store_deref(b, vec_dst, nir_vec(b, vals, run), nir_component_mask(run));
       }
       if (tail)
          nir_pop_if(b, tail);
    }
 
-   if (loop) {
-      nir_store_var(b, j_var, nir_iadd_imm(b, j, 1), 1);
-      nir_pop_loop(b, loop);
+}
+
+/* Most runs per invocation whose values a generic fill computes ahead */
+#define STAGE_MAX_PREFETCH_RUNS 64
+
+/* How a generic fill goes: element by element, or by decode vector when the
+ * vector runs along the inner dimension.
+ */
+struct stage_generic_plan {
+   struct stage_generic_iter it;
+   unsigned iters;
+   bool unrolled;
+   /* All values can be computed before the barrier and stored after */
+   bool prefetch;
+};
+
+static void
+stage_generic_plan_init(nir_builder *b, struct stage_load *sl, nir_variable *tile,
+                        unsigned wg_size, struct stage_generic_plan *plan)
+{
+   const struct glsl_cmat_description desc = stage_call_desc(sl->call);
+   const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(sl->call);
+   const struct stage_layout l = get_stage_layout(desc);
+   const unsigned total = l.inner * l.outer;
+   struct nir_calc_tensor_info *info = &sl->info;
+
+   unsigned run = l.inner % 8 == 0 ? 8 : 1;
+   bool vec_decode = false;
+   if (info->decode_vec_fnptr) {
+      const bool transposed = info->view && info->view_permutations[0] == 1;
+      const unsigned width = glsl_get_vector_elements(
+         glsl_get_bare_type(info->decode_vec_fnptr->params[0].type));
+      if (!info->view_has_dims && transposed == l.col_major &&
+          width > 1 && width <= 8 && l.inner % width == 0) {
+         run = width;
+         vec_decode = true;
+      }
    }
 
-   if (fast_if)
-      nir_pop_if(b, fast_if);
+   /* Each invocation handles per_inv runs, about 8 elements of them per
+    * iteration so that their loads overlap without running out of
+    * registers.  The trip count is the same everywhere.
+    */
+   const unsigned runs = total / run;
+   const unsigned per_inv = DIV_ROUND_UP(runs, wg_size);
+   const unsigned unroll = MIN2(per_inv, MAX2(1, 8 / run));
+   const bool exact = runs % (wg_size * unroll) == 0;
+   plan->iters = DIV_ROUND_UP(per_inv, unroll);
+
+   /* Inside a loop, keep it the innermost one so that it can be unrolled:
+    * shaders unroll their K loops, and that is what lets the loads of one
+    * step move up past the multiplies of the step before.
+    */
+   bool in_loop = false;
+   for (nir_cf_node *n = sl->call->instr.block->cf_node.parent; n; n = n->parent)
+      in_loop |= n->type == nir_cf_node_loop;
+   plan->unrolled = in_loop || plan->iters == 1;
+
+   plan->prefetch = plan->unrolled && exact && !tl.tensor_view &&
+                    plan->iters * unroll <= STAGE_MAX_PREFETCH_RUNS;
+
+   plan->it = (struct stage_generic_iter) {
+      .info = info, .base = sl->base, .tile = tile,
+      .li = nir_load_local_invocation_index(b), .wg_size = wg_size,
+      .offset = sl->offset, .run = run, .unroll = unroll, .runs = runs,
+      .exact = exact, .vec_decode = vec_decode,
+   };
+}
+
+/* Computes the values of a prefetch plan, for stage_generic_stores() */
+static void
+stage_generic_values(nir_builder *b, struct stage_load *sl,
+                     const struct stage_generic_plan *plan, nir_def **vals)
+{
+   unsigned n = 0;
+   for (unsigned j = 0; j < plan->iters; j++)
+      stage_fill_generic_iter(b, sl, &plan->it, nir_imm_int(b, j), vals, NULL, &n);
+}
+
+static void
+stage_generic_stores(nir_builder *b, struct stage_load *sl,
+                     const struct stage_generic_plan *plan, nir_def *const *vals)
+{
+   unsigned n = 0;
+   for (unsigned j = 0; j < plan->iters; j++)
+      stage_fill_generic_iter(b, sl, &plan->it, nir_imm_int(b, j), NULL, vals, &n);
+}
+
+/* Fills the tile however the load needs it */
+static void
+stage_fill_generic(nir_builder *b, struct stage_load *sl, nir_variable *tile,
+                   unsigned wg_size)
+{
+   nir_cmat_call_instr *call = sl->call;
+   const struct glsl_cmat_description desc = stage_call_desc(call);
+   const struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+   const struct stage_layout l = get_stage_layout(desc);
+
+   /* Clipped elements come from the clip matrix.  Put it in the tile first
+    * unless the view can't clip.
+    */
+   if (tl.tensor_view) {
+      struct nir_calc_tensor_info *info = &sl->info;
+      nir_def *no_clip =
+         nir_iand(b, nir_iand(b, nir_ieq_imm(b, info->clip_row_offset, 0),
+                                 nir_ieq_imm(b, info->clip_col_offset, 0)),
+                     nir_iand(b, nir_uge_imm(b, info->clip_row_span, desc.rows),
+                                 nir_uge_imm(b, info->clip_col_span, desc.cols)));
+      nir_push_if(b, nir_inot(b, no_clip));
+      nir_cmat_store(b, &stage_tile_ptr(b, tile, nir_imm_int(b, sl->offset))->def,
+                     call->params[4].ssa, nir_imm_int(b, l.stride),
+                     .matrix_layout = l.layout);
+      stage_barrier(b);
+      nir_pop_if(b, NULL);
+   }
+
+   struct stage_generic_plan plan;
+   stage_generic_plan_init(b, sl, tile, wg_size, &plan);
+
+   if (plan.unrolled) {
+      for (unsigned j = 0; j < plan.iters; j++)
+         stage_fill_generic_iter(b, sl, &plan.it, nir_imm_int(b, j), NULL, NULL, NULL);
+   } else {
+      nir_variable *j_var =
+         nir_local_variable_create(b->impl, glsl_uint_type(), "cmat_stage_j");
+      nir_store_var(b, j_var, nir_imm_int(b, 0), 1);
+      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *j = nir_load_var(b, j_var);
+         nir_break_if(b, nir_uge_imm(b, j, plan.iters));
+         stage_fill_generic_iter(b, sl, &plan.it, j, NULL, NULL, NULL);
+         nir_store_var(b, j_var, nir_iadd_imm(b, j, 1), 1);
+      }
+      nir_pop_loop(b, loop);
+   }
+}
+
+/* The direct load as a plain strided load from memory */
+static void
+stage_direct_load_fast(nir_builder *b, struct stage_load *sl)
+{
+   const struct glsl_cmat_description desc = stage_call_desc(sl->call);
+   const unsigned elem_bytes = glsl_base_type_bit_size(desc.element_type) / 8;
+
+   nir_deref_instr *ptr =
+      nir_build_deref_cast_with_alignment(b, sl->ft.addr, nir_var_mem_global,
+                                          glsl_scalar_type(desc.element_type),
+                                          elem_bytes, 16, 0);
+   nir_cmat_load(b, sl->call->params[0].ssa, &ptr->def, sl->ft.stride,
+                 .matrix_layout = sl->ft.transpose ? GLSL_MATRIX_LAYOUT_COLUMN_MAJOR :
+                                                     GLSL_MATRIX_LAYOUT_ROW_MAJOR);
 }
 
 static void
@@ -2169,44 +2378,128 @@ can_stage_tensor_load(nir_cmat_call_instr *call)
           util_is_power_of_two_nonzero(l.inner);
 }
 
-/* Whether the fill of first can move up to second: nothing in between may
- * look at first's result or synchronize.
+/* For nir_foreach_src(): false if src is a deref of the variable data */
+static bool
+src_is_var_deref(nir_src *src, void *data)
+{
+   nir_deref_instr *deref = nir_src_as_deref(*src);
+   return !(deref && nir_deref_instr_get_variable(deref) == data);
+}
+
+#define STAGE_MAX_COPIES 8
+
+/* Whether the fill of first can move down to second: nothing in between may
+ * synchronize or look at first's result, except copies of it (vtn's
+ * temporaries) that nothing else in between uses.  Those are returned, to
+ * move after the staging.
  */
 static bool
-can_pair_stage(nir_cmat_call_instr *first, nir_cmat_call_instr *second)
+can_pair_stage(nir_cmat_call_instr *first, nir_cmat_call_instr *second,
+               nir_instr **copies, unsigned *num_copies)
 {
+   *num_copies = 0;
    if (first->instr.block != second->instr.block)
       return false;
 
-   nir_variable *dst = nir_deref_instr_get_variable(nir_src_as_deref(first->params[0]));
-   if (!dst)
+   nir_variable *vars[1 + STAGE_MAX_COPIES];
+   unsigned num_vars = 0;
+   vars[num_vars] = nir_deref_instr_get_variable(nir_src_as_deref(first->params[0]));
+   if (!vars[num_vars++])
       return false;
 
    for (nir_instr *instr = nir_instr_next(&first->instr);
         instr != &second->instr; instr = nir_instr_next(instr)) {
       switch (instr->type) {
       case nir_instr_type_deref:
-         if (nir_deref_instr_get_variable(nir_instr_as_deref(instr)) == dst)
-            return false;
-         break;
-      case nir_instr_type_intrinsic:
-         if (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_barrier)
-            return false;
-         break;
+         continue;
       case nir_instr_type_call:
       case nir_instr_type_cmat_call:
          return false;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_barrier)
+            return false;
+         if (intr->intrinsic == nir_intrinsic_cmat_copy) {
+            nir_variable *src = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[1]));
+            nir_variable *dst = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+            bool reads_result = false;
+            for (unsigned v = 0; v < num_vars; v++)
+               reads_result |= src == vars[v];
+            if (reads_result) {
+               if (!dst || *num_copies == STAGE_MAX_COPIES)
+                  return false;
+               copies[(*num_copies)++] = instr;
+               vars[num_vars++] = dst;
+               continue;
+            }
+         }
+         break;
+      }
       default:
          break;
       }
+
+      for (unsigned v = 0; v < num_vars; v++) {
+         if (!nir_foreach_src(instr, src_is_var_deref, vars[v]))
+            return false;
+      }
    }
 
-   return nir_deref_instr_get_variable(nir_src_as_deref(second->params[0])) != dst;
+   for (unsigned v = 0; v < num_vars; v++) {
+      if (!nir_foreach_src(&second->instr, src_is_var_deref, vars[v]))
+         return false;
+   }
+   return true;
+}
+
+/* Whether the whole staging of first can move down to after second: on
+ * top of can_pair_stage(), nothing in between may write what first reads.
+ */
+static bool
+can_defer_stage(nir_cmat_call_instr *first, nir_cmat_call_instr *second,
+                nir_instr **copies, unsigned *num_copies)
+{
+   if (!can_pair_stage(first, second, copies, num_copies))
+      return false;
+
+   for (nir_instr *instr = nir_instr_next(&first->instr);
+        instr != &second->instr; instr = nir_instr_next(instr)) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_store_deref &&
+          intr->intrinsic != nir_intrinsic_copy_deref)
+         continue;
+      nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+      if (!var || !nir_foreach_src(&first->instr, src_is_var_deref, var))
+         return false;
+   }
+   return true;
+}
+
+/* The next tensor load in the same block, if any */
+static nir_cmat_call_instr *
+next_tensor_load(nir_cmat_call_instr *call)
+{
+   for (nir_instr *instr = nir_instr_next(&call->instr); instr;
+        instr = nir_instr_next(instr)) {
+      if (instr->type == nir_instr_type_cmat_call &&
+          nir_instr_as_cmat_call(instr)->op == nir_cmat_call_op_tensor_load)
+         return nir_instr_as_cmat_call(instr);
+   }
+   return NULL;
 }
 
 struct stage_group {
    nir_cmat_call_instr *calls[2];
    unsigned count;
+   /* Unstaged tensor load to stage after, so that its global loads
+    * overlap with the fill's.
+    */
+   nir_cmat_call_instr *after;
+   /* Copies of the first load's result to move after the staging */
+   nir_instr *copies[STAGE_MAX_COPIES];
+   unsigned num_copies;
 };
 
 /* Workgroup scope matrices are split into one piece per subgroup, and each
@@ -2215,14 +2508,16 @@ struct stage_group {
  * element once into shared memory and let the subgroups load their pieces
  * from there.  With 8 subgroups or fewer, every subgroup needs all of A
  * but only its own columns of B, so B is only staged together with an A
- * load right before it, sharing its barriers.  Workgroup scope loads are
+ * load right before it, sharing its barriers; that still makes its loads
+ * 16 bytes wide.  Workgroup scope loads are
  * in workgroup uniform control flow.
  *
  * The tile is returned so that the split pass can share it for its
  * temporaries: each use of either starts with a barrier.
  */
 bool
-nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
+nak_nir_stage_cmat_tensor_loads(nir_shader *nir, const struct nak_compiler *nak,
+                                nir_variable **tile_out)
 {
    *tile_out = NULL;
    if (nir->info.workgroup_size_variable)
@@ -2242,8 +2537,8 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
       glsl_get_natural_size_align_bytes(var->type, &size, &align);
       app_shared = align_uintptr(app_shared, align) + size;
    }
-   const unsigned budget = NAK_CMAT_MAX_SHARED_BYTES -
-                           MIN2(app_shared, NAK_CMAT_MAX_SHARED_BYTES);
+   const unsigned max_shared = nak_cmat_max_shared_bytes(nak);
+   const unsigned budget = max_shared - MIN2(app_shared, max_shared);
 
    void *mem_ctx = ralloc_context(NULL);
    struct util_dynarray cands, groups;
@@ -2272,8 +2567,9 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
       if (i + 1 < num_cands) {
          const unsigned pair_bytes =
             bytes + staged_tile_elems(stage_call_desc(cand[i + 1])) * 2;
-         if (pair_bytes <= budget && can_pair_stage(cand[i], cand[i + 1])) {
-            struct stage_group g = { { cand[i], cand[i + 1] }, 2 };
+         struct stage_group g = { { cand[i], cand[i + 1] }, 2 };
+         if (pair_bytes <= budget &&
+             can_defer_stage(cand[i], cand[i + 1], g.copies, &g.num_copies)) {
             util_dynarray_append(&groups, g);
             max_bytes = MAX2(max_bytes, pair_bytes);
             i++;
@@ -2286,6 +2582,21 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
          util_dynarray_append(&groups, g);
          max_bytes = MAX2(max_bytes, bytes);
       }
+   }
+
+   /* A single staged load followed by one that isn't staged gets staged
+    * after that one.
+    */
+   struct set *staged = _mesa_pointer_set_create(mem_ctx);
+   util_dynarray_foreach(&groups, struct stage_group, g) {
+      for (unsigned i = 0; i < g->count; i++)
+         _mesa_set_add(staged, g->calls[i]);
+   }
+   util_dynarray_foreach(&groups, struct stage_group, g) {
+      nir_cmat_call_instr *next = next_tensor_load(g->calls[0]);
+      if (g->count == 1 && next && !_mesa_set_search(staged, next) &&
+          can_defer_stage(g->calls[0], next, g->copies, &g->num_copies))
+         g->after = next;
    }
 
    if (max_bytes == 0 || getenv("NAK_CMAT_NO_STAGE")) {
@@ -2308,16 +2619,100 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
       if (g->count > 1)
          offsets[1] = staged_tile_elems(stage_call_desc(g->calls[0]));
 
-      b.cursor = nir_before_instr(&g->calls[0]->instr);
-      /* Readers of the previous tile are done */
-      stage_barrier(&b);
-      for (unsigned i = 0; i < g->count; i++) {
-         b.cursor = nir_before_instr(&g->calls[i]->instr);
-         stage_fill(&b, g->calls[i], tile, offsets[i], wg_size);
+      /* Everything goes in one place, after the last load, when the earlier
+       * ones can move there.  Then one branch picks the fast path for all of
+       * them: NAK waits for all outstanding loads at every branch.
+       */
+      const bool together = g->after || g->count > 1;
+      b.cursor = g->after ? nir_after_instr(&g->after->instr) :
+                 together ? nir_before_instr(&g->calls[1]->instr) :
+                            nir_before_instr(&g->calls[0]->instr);
+
+      struct stage_load sl[2], direct;
+      bool all_fast = together;
+      if (together) {
+         for (unsigned i = 0; i < g->count; i++) {
+            stage_load_init(&b, &sl[i], g->calls[i], offsets[i], false, wg_size);
+            all_fast &= sl[i].fast;
+         }
+         if (g->after) {
+            stage_load_init(&b, &direct, g->after, 0, true, wg_size);
+            all_fast &= direct.fast;
+         }
       }
+
+      if (all_fast) {
+         nir_def *ok = g->after ? direct.ft.ok : nir_imm_true(&b);
+         for (unsigned i = 0; i < g->count; i++)
+            ok = nir_iand(&b, ok, sl[i].ft.ok);
+
+         /* The fills' global loads go first, ahead of the barrier and any
+          * branch, so that they can overlap with what came before.
+          */
+         nir_def *vals[2][STAGE_MAX_FAST_LOADS];
+         for (unsigned i = 0; i < g->count; i++)
+            stage_fill_fast_loads(&b, &sl[i], ok, wg_size, vals[i]);
+
+         /* Readers of the previous tile are done */
+         stage_barrier(&b);
+
+         nir_push_if(&b, ok);
+         if (g->after)
+            stage_direct_load_fast(&b, &direct);
+         for (unsigned i = 0; i < g->count; i++)
+            stage_fill_fast_stores(&b, &sl[i], tile, wg_size, vals[i]);
+         nir_push_else(&b, NULL);
+         if (g->after) {
+            nir_instr_remove(&g->after->instr);
+            nir_builder_instr_insert(&b, &g->after->instr);
+         }
+         for (unsigned i = 0; i < g->count; i++)
+            stage_fill_generic(&b, &sl[i], tile, wg_size);
+         nir_pop_if(&b, NULL);
+      } else {
+         /* Each load picks its own path, with all the global loads that
+          * can go before the barrier going there.
+          */
+         if (!together) {
+            assert(g->count == 1);
+            stage_load_init(&b, &sl[0], g->calls[0], offsets[0], false, wg_size);
+         }
+
+         struct stage_generic_plan plans[2];
+         nir_def *vals[2][MAX2(STAGE_MAX_FAST_LOADS, STAGE_MAX_PREFETCH_RUNS)];
+         for (unsigned i = 0; i < g->count; i++) {
+            stage_generic_plan_init(&b, &sl[i], tile, wg_size, &plans[i]);
+            if (sl[i].fast)
+               stage_fill_fast_loads(&b, &sl[i], sl[i].ft.ok, wg_size, vals[i]);
+            else if (plans[i].prefetch)
+               stage_generic_values(&b, &sl[i], &plans[i], vals[i]);
+         }
+
+         /* Readers of the previous tile are done */
+         stage_barrier(&b);
+
+         for (unsigned i = 0; i < g->count; i++) {
+            if (sl[i].fast) {
+               nir_push_if(&b, sl[i].ft.ok);
+               stage_fill_fast_stores(&b, &sl[i], tile, wg_size, vals[i]);
+               nir_push_else(&b, NULL);
+               stage_fill_generic(&b, &sl[i], tile, wg_size);
+               nir_pop_if(&b, NULL);
+            } else if (plans[i].prefetch) {
+               stage_generic_stores(&b, &sl[i], &plans[i], vals[i]);
+            } else {
+               stage_fill_generic(&b, &sl[i], tile, wg_size);
+            }
+         }
+      }
+
       stage_barrier(&b);
       for (unsigned i = 0; i < g->count; i++)
          stage_load_from_tile(&b, g->calls[i], tile, offsets[i]);
+      for (unsigned i = 0; i < g->num_copies; i++) {
+         nir_instr_remove(g->copies[i]);
+         nir_builder_instr_insert(&b, g->copies[i]);
+      }
       for (unsigned i = 0; i < g->count; i++)
          nir_instr_remove(&g->calls[i]->instr);
    }
@@ -2335,25 +2730,18 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, nir_variable **tile_out)
 static nir_variable *
 cmat_load_dst_var(nir_instr *instr)
 {
-   nir_src *dst;
-   if (instr->type == nir_instr_type_intrinsic &&
-       (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_cmat_load ||
-        nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_cmat_copy)) {
-      dst = &nir_instr_as_intrinsic(instr)->src[0];
-   } else if (instr->type == nir_instr_type_cmat_call &&
-              nir_instr_as_cmat_call(instr)->op == nir_cmat_call_op_tensor_load) {
-      dst = &nir_instr_as_cmat_call(instr)->params[0];
-   } else {
+   if (instr->type != nir_instr_type_intrinsic)
+      return NULL;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic == nir_intrinsic_cmat_load) {
+      /* Global loads stay together so that their latencies overlap */
+      if (!nir_deref_mode_is(nir_src_as_deref(intr->src[1]), nir_var_mem_shared))
+         return NULL;
+   } else if (intr->intrinsic != nir_intrinsic_cmat_copy) {
       return NULL;
    }
-   return nir_deref_instr_get_variable(nir_src_as_deref(*dst));
-}
-
-static bool
-src_is_var_deref(nir_src *src, void *data)
-{
-   nir_deref_instr *deref = nir_src_as_deref(*src);
-   return !(deref && nir_deref_instr_get_variable(deref) == data);
+   return nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
 }
 
 /* Instructions a matrix load may move past: they only compute values,
@@ -2398,8 +2786,8 @@ can_sink_cmat_load_past(nir_instr *instr, nir_instr *load)
  * them, which keeps all the pieces live at once.  Workgroup scope A
  * matrices are whole in every subgroup, which doesn't fit the register
  * file next to the accumulators.  Load (and copy) each piece where it is
- * first used.  Going backwards, copies move first and their sources then
- * follow them.
+ * first used if it comes from shared memory, which is quick.  Going
+ * backwards, copies move first and their sources then follow them.
  */
 bool
 nak_nir_sink_cmat_loads(nir_shader *nir)
