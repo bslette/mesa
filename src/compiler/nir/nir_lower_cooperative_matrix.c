@@ -888,13 +888,17 @@ split_cmat_muladd(nir_builder *b,
                  a_split->box.outer_cols;
    }
 
-   for (unsigned m = 0; m < m_splits; m++) {
-      for (unsigned n = 0; n < n_splits; n++) {
-         unsigned idx = m * n_splits + n;
-         nir_deref_instr *dst_deref = result_split ? recreate_derefs(b, &intr->src[0], result_split->split_vars[idx]) : nir_src_as_deref(intr->src[0]);
-         nir_deref_instr *c_deref = c_split ? recreate_derefs(b, &intr->src[3], c_split->split_vars[idx]) : nir_src_as_deref(intr->src[3]);
+   /* K outermost: consecutive multiplies go to different accumulators, so
+    * they don't wait for each other, and each A piece is only needed for
+    * one row of them.
+    */
+   for (unsigned k = 0; k < k_splits; k++) {
+      for (unsigned m = 0; m < m_splits; m++) {
+         for (unsigned n = 0; n < n_splits; n++) {
+            unsigned idx = m * n_splits + n;
+            nir_deref_instr *dst_deref = result_split ? recreate_derefs(b, &intr->src[0], result_split->split_vars[idx]) : nir_src_as_deref(intr->src[0]);
+            nir_deref_instr *c_deref = c_split ? recreate_derefs(b, &intr->src[3], c_split->split_vars[idx]) : nir_src_as_deref(intr->src[3]);
 
-         for (unsigned k = 0; k < k_splits; k++) {
             unsigned a_idx;
             if (a_split && a_split->box.wg_split) {
                /* Same order as get_wg_split_offsets_imm() */
