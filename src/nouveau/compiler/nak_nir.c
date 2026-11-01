@@ -401,6 +401,64 @@ type_has_flexible_cmat(const struct glsl_type *type)
  * natively.  Only run it on shaders that need it.
  */
 static bool
+var_is_wg_cmat_a(nir_variable *var)
+{
+   const struct glsl_type *type = glsl_without_array(var->type);
+   if (!glsl_type_is_cmat(type))
+      return false;
+   const struct glsl_cmat_description *desc = glsl_get_cmat_description(type);
+   return desc->scope == SCOPE_WORKGROUP && desc->use == GLSL_CMAT_USE_A;
+}
+
+static bool
+writes_wg_cmat_a(nir_src *src, void *data)
+{
+   nir_deref_instr *deref = nir_src_as_deref(*src);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (var && var_is_wg_cmat_a(var))
+      *(bool *)data = true;
+   return true;
+}
+
+/* Whether some workgroup scope A matrix is computed rather than loaded,
+ * like the P = exp(S - max) of flash attention.  Splitting by columns gives
+ * every subgroup all of A; that is fine for loaded matrices, which can be
+ * reloaded piece by piece from the staging tile, but computed ones then
+ * stay whole in every subgroup.
+ */
+static bool
+nak_nir_has_computed_wg_cmat_a(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_cmat_convert:
+            case nir_intrinsic_cmat_construct:
+            case nir_intrinsic_cmat_unary_op:
+            case nir_intrinsic_cmat_binary_op:
+            case nir_intrinsic_cmat_scalar_op:
+            case nir_intrinsic_cmat_transpose:
+            case nir_intrinsic_cmat_bitcast: {
+               bool writes_a = false;
+               writes_wg_cmat_a(&intr->src[0], &writes_a);
+               if (writes_a)
+                  return true;
+               break;
+            }
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+static bool
 nak_nir_has_flexible_cmat(nir_shader *nir)
 {
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp) {
@@ -428,8 +486,11 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
       return;
 
    if (nak_nir_has_flexible_cmat(nir)) {
+      const unsigned inner_box_rows =
+         (getenv("NAK_CMAT_ROW_SPLIT") || nak_nir_has_computed_wg_cmat_a(nir)) ? ~0u : 0;
+
       nir_variable *stage_tile;
-      OPT(nir, nak_nir_stage_cmat_tensor_loads, nak, &stage_tile);
+      OPT(nir, nak_nir_stage_cmat_tensor_loads, nak, inner_box_rows, &stage_tile);
 
       /* M16N8K16 is the native MMA, our 16x16 accumulators are two of them */
       const struct nir_lower_coopmat_args coopmat_args = {
@@ -438,6 +499,7 @@ nak_nir_lower_cooperative_matrix(nir_shader *nir, const struct nak_compiler *nak
          .k_gran = 16,
          .alias_shared_temps = true,
          .shared_temp = stage_tile,
+         .inner_box_rows = inner_box_rows,
       };
       if (OPT(nir, nir_lower_cooperative_matrix_flexible_dimensions,
               &coopmat_args)) {

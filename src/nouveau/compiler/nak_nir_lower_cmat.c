@@ -2506,10 +2506,10 @@ struct stage_group {
  * subgroup would load (and decode) every A or B element it needs on its
  * own, straight from memory.  Instead, have the whole workgroup load each
  * element once into shared memory and let the subgroups load their pieces
- * from there.  With 8 subgroups or fewer, every subgroup needs all of A
- * but only its own columns of B, so B is only staged together with an A
- * load right before it, sharing its barriers; that still makes its loads
- * 16 bytes wide.  Workgroup scope loads are
+ * from there.  Split by columns, every subgroup needs all of A but only
+ * its own columns of B, so B is only staged together with an A load right
+ * before it, sharing its barriers; that still makes its loads 16 bytes
+ * wide.  Split by rows, it is the other way around.  Workgroup scope loads are
  * in workgroup uniform control flow.
  *
  * The tile is returned so that the split pass can share it for its
@@ -2517,7 +2517,7 @@ struct stage_group {
  */
 bool
 nak_nir_stage_cmat_tensor_loads(nir_shader *nir, const struct nak_compiler *nak,
-                                nir_variable **tile_out)
+                                unsigned inner_box_rows, nir_variable **tile_out)
 {
    *tile_out = NULL;
    if (nir->info.workgroup_size_variable)
@@ -2526,9 +2526,14 @@ nak_nir_stage_cmat_tensor_loads(nir_shader *nir, const struct nak_compiler *nak,
    const unsigned wg_size = nir->info.workgroup_size[0] *
                             nir->info.workgroup_size[1] *
                             nir->info.workgroup_size[2];
+   /* The same subgroup box as nir_lower_cooperative_matrix_flexible_dimensions() */
    const unsigned num_sg = DIV_ROUND_UP(wg_size, NAK_SUBGROUP_SIZE);
-   const unsigned box_cols = MIN2(num_sg, 8);
-   const unsigned box_rows = num_sg / box_cols;
+   unsigned box_cols = MIN2(num_sg, 8);
+   unsigned box_rows = num_sg / box_cols;
+   if (inner_box_rows) {
+      box_rows = MIN2(inner_box_rows, num_sg);
+      box_cols = num_sg / box_rows;
+   }
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
 
    unsigned app_shared = 0;
