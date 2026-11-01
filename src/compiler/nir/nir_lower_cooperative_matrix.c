@@ -2099,7 +2099,9 @@ nir_calc_tensor_derefs_init(nir_builder *b, struct nir_calc_tensor_info *info,
       info->view_has_dims = tensor_load.view_has_dims;
    }
 
+   info->rows = orig_desc.rows;
    info->cols = orig_desc.cols;
+   info->row_base.row = NULL;
    info->wg = tensor_load.wg;
    info->inner_rows = tensor_load.inner_rows;
    info->inner_cols = tensor_load.inner_cols;
@@ -2188,10 +2190,78 @@ nir_calc_tensor_view_linear(nir_builder *b,
    return idx;
 }
 
-nir_def *
-nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
-                       nir_def *row, nir_def *col,
-                       nir_deref_instr **iter_deref_p)
+static nir_function *
+tensor_decode_fn(const struct nir_calc_tensor_info *info)
+{
+   if (info->decode_vec_fnptr && info->use_vec_decode)
+      return info->decode_vec_fnptr;
+   else
+      return info->decode_fnptr;
+}
+
+/*
+ * The first parameter must be a pointer type with storage class PhysicalStorageBuffer,
+ * and the parameter is filled a pointer computed by multiplying the index returned by
+ * matrixCoordToTensorElement(WithView) by the size of the pointee type.
+ */
+static const struct glsl_type *
+tensor_decode_block_type(nir_function *decode_fn)
+{
+   nir_deref_instr *param_deref = find_decode_deref(decode_fn->impl);
+   return decode_fn->cmat_decode_type ? decode_fn->cmat_decode_type :
+          param_deref ? param_deref->type : NULL;
+}
+
+/* Calls the decode function on block index idx from the pointer at addr.
+ * The block's deref goes in *block_out.
+ */
+static nir_def *
+tensor_decode(nir_builder *b, struct nir_calc_tensor_info *info,
+              nir_def *addr, nir_variable_mode modes, nir_def *idx,
+              nir_def *const *block_coord, nir_def *const *coord_in_block,
+              nir_def **block_out)
+{
+   const int nc = info->spans->num_components;
+   nir_function *decode_fn = tensor_decode_fn(info);
+   const struct glsl_type *out_type = glsl_get_bare_type(decode_fn->params[0].type);
+   nir_variable *decode_out_tmp = nir_local_variable_create(b->impl, out_type, "decode_vec_tmp");
+   nir_deref_instr *decode_out_tmp_deref = nir_build_deref_var(b, decode_out_tmp);
+   nir_call_instr *call = nir_call_instr_create(b->shader, decode_fn);
+   const struct glsl_type *block_type = tensor_decode_block_type(decode_fn);
+   nir_def *idx_def;
+   if (block_type) {
+      nir_deref_instr *idx_deref = nir_build_deref_cast(b, addr, modes, block_type,
+                                                        glsl_get_explicit_size(block_type, true));
+      idx_deref = nir_build_deref_ptr_as_array(b, idx_deref, idx);
+      idx_def = &idx_deref->def;
+   } else
+      idx_def = nir_undef(b, decode_fn->params[1].num_components, decode_fn->params[1].bit_size);
+   if (block_out)
+      *block_out = block_type ? idx_def : NULL;
+
+   call->params[0] = nir_src_for_ssa(&decode_out_tmp_deref->def);
+   call->params[1] = nir_src_for_ssa(idx_def);
+   for (unsigned dim = 0; dim < nc; dim++) {
+      call->params[2 + dim] = nir_src_for_ssa(block_coord[dim]);
+      call->params[2 + nc + dim] = nir_src_for_ssa(coord_in_block[dim]);
+   }
+   nir_builder_instr_insert(b, &call->instr);
+   return nir_load_deref(b, decode_out_tmp_deref);
+}
+
+/* Where a decode reads: block index idx from addr */
+struct tensor_coords {
+   nir_deref_instr *addr;
+   nir_def *idx;
+   nir_def *block_coord[2];
+   nir_def *coord_in_block[2];
+};
+
+/* With coords and a decode function, only computes where the decode reads */
+static nir_def *
+calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
+                   nir_def *row, nir_def *col,
+                   nir_deref_instr **iter_deref_p, struct tensor_coords *coords)
 {
    nir_def *idx;
    nir_def *span_coord[5];
@@ -2285,46 +2355,19 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
       idx = nir_iadd(b, idx, nir_imul(b, block_coord[dim], nir_channel(b, info->strides, dim)));
    }
 
-   nir_function *decode_fn;
-   if (info->decode_vec_fnptr && info->use_vec_decode)
-      decode_fn = info->decode_vec_fnptr;
-   else
-      decode_fn = info->decode_fnptr;
-
-   if (decode_fn) {
-      const struct glsl_type *out_type = glsl_get_bare_type(decode_fn->params[0].type);
-      nir_variable *decode_out_tmp = nir_local_variable_create(b->impl, out_type, "decode_vec_tmp");
-      nir_deref_instr *decode_out_tmp_deref = nir_build_deref_var(b, decode_out_tmp);
-      nir_call_instr *call = nir_call_instr_create(b->shader, decode_fn);
-      nir_deref_instr *param_deref = find_decode_deref(decode_fn->impl);
-
-      /*
-       * The first parameter must be a pointer type with storage class PhysicalStorageBuffer,
-       * and the parameter is filled a pointer computed by multiplying the index returned by
-       * matrixCoordToTensorElement(WithView) by the size of the pointee type.
-       */
-      const struct glsl_type *block_type =
-         decode_fn->cmat_decode_type ? decode_fn->cmat_decode_type :
-         param_deref ? param_deref->type : NULL;
-      nir_def *idx_def;
-      if (block_type) {
-         nir_deref_instr *idx_deref = nir_build_deref_cast(b, &iter_deref->def,
-                                                           iter_deref->modes,
-                                                           block_type,
-                                                           glsl_get_explicit_size(block_type, true));
-         idx_deref = nir_build_deref_ptr_as_array(b, idx_deref, nir_u2uN(b, idx, iter_deref->def.bit_size));
-         idx_def = &idx_deref->def;
-      } else
-         idx_def = nir_undef(b, decode_fn->params[1].num_components, decode_fn->params[1].bit_size);
-
-      call->params[0] = nir_src_for_ssa(&decode_out_tmp_deref->def);
-      call->params[1] = nir_src_for_ssa(idx_def);
-      for (unsigned dim = 0; dim < nc; dim++) {
-         call->params[2 + dim] = nir_src_for_ssa(block_coord[dim]);
-         call->params[2 + nc + dim] = nir_src_for_ssa(coord_in_block[dim]);
+   if (info->decode_fnptr && coords) {
+      assert(nc == 2);
+      coords->addr = iter_deref;
+      coords->idx = idx;
+      for (unsigned dim = 0; dim < 2; dim++) {
+         coords->block_coord[dim] = block_coord[dim];
+         coords->coord_in_block[dim] = coord_in_block[dim];
       }
-      nir_builder_instr_insert(b, &call->instr);
-      idx = nir_load_deref(b, decode_out_tmp_deref);
+      return NULL;
+   } else if (info->decode_fnptr) {
+      idx = tensor_decode(b, info, &iter_deref->def, iter_deref->modes,
+                          nir_u2uN(b, idx, iter_deref->def.bit_size),
+                          block_coord, coord_in_block, NULL);
    } else {
       *iter_deref_p = nir_build_deref_ptr_as_array(b, iter_deref, nir_u2uN(b, idx, iter_deref->def.bit_size));
    }
@@ -2332,3 +2375,110 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
    return idx;
 }
 
+nir_def *
+nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
+                       nir_def *row, nir_def *col,
+                       nir_deref_instr **iter_deref_p)
+{
+   return calc_tensor_derefs(b, info, row, col, iter_deref_p, NULL);
+}
+
+static nir_def *
+decode_at(nir_builder *b, struct nir_calc_tensor_info *info,
+          const struct tensor_coords *c, nir_def **block_out)
+{
+   return tensor_decode(b, info, &c->addr->def, c->addr->modes,
+                        nir_u2uN(b, c->idx, c->addr->def.bit_size),
+                        c->block_coord, c->coord_in_block, block_out);
+}
+
+/* Decodes at (row + row_delta, col).  The decode at (row, col) comes first,
+ * and later rows, in increasing order, step from the block pointer of the
+ * one before instead of addressing from scratch.  That holds when the span is the whole matrix, so that rows map
+ * straight to tensor rows, and the step is whole blocks; the check folds
+ * away once the layout is constant, and so does the addressing it saves.
+ */
+nir_def *
+nir_calc_tensor_decode_rows(nir_builder *b, struct nir_calc_tensor_info *info,
+                            nir_deref_instr *base, nir_def *row,
+                            unsigned row_delta, nir_def *col)
+{
+   nir_deref_instr *iter_deref = base;
+   if (!info->decode_fnptr || info->view ||
+       info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED ||
+       info->spans->num_components != 2)
+      return calc_tensor_derefs(b, info, nir_iadd_imm(b, row, row_delta), col,
+                                &iter_deref, NULL);
+
+   const bool have_base = info->row_base.row == row && info->row_base.col == col;
+   if (row_delta == 0 || !have_base) {
+      struct tensor_coords c;
+      calc_tensor_derefs(b, info, nir_iadd_imm(b, row, row_delta), col,
+                         &iter_deref, &c);
+      nir_def *block;
+      nir_def *val = decode_at(b, info, &c, &block);
+      if (row_delta == 0 && block) {
+         info->row_base.row = row;
+         info->row_base.col = col;
+         info->row_base.delta = 0;
+         info->row_base.block = block;
+         info->row_base.idx = c.idx;
+         for (unsigned dim = 0; dim < 2; dim++) {
+            info->row_base.block_coord[dim] = c.block_coord[dim];
+            info->row_base.coord_in_block[dim] = c.coord_in_block[dim];
+         }
+      }
+      return val;
+   }
+
+   struct tensor_coords c;
+   calc_tensor_derefs(b, info, nir_iadd_imm(b, row, row_delta), col,
+                      &iter_deref, &c);
+
+   /* From the last row decoded, so that the steps are all the same */
+   assert(row_delta > info->row_base.delta);
+   nir_def *delta = nir_imm_int(b, row_delta - info->row_base.delta);
+   nir_def *bs0 = nir_channel(b, info->block_sizes, 0);
+   nir_def *ok =
+      nir_iand(b, nir_iand(b, nir_ieq_imm(b, nir_channel(b, info->spans, 1), info->cols),
+                              nir_uge_imm(b, nir_channel(b, info->spans, 0), info->rows)),
+                  nir_ieq_imm(b, nir_umod(b, delta, bs0), 0));
+   nir_def *blocks = nir_udiv(b, delta, bs0);
+
+   /* In bytes and 64-bit, and not as a multiple of the block size, which
+    * would merge it back into the full addressing.
+    */
+   const unsigned block_size =
+      glsl_get_explicit_size(tensor_decode_block_type(tensor_decode_fn(info)), true);
+   const unsigned addr_bits = info->row_base.block->bit_size;
+   nir_def *stride0 = nir_channel(b, info->strides, 0);
+   nir_def *step =
+      nir_bcsel(b, ok,
+                nir_imul(b, nir_i2iN(b, stride0, addr_bits),
+                         nir_i2iN(b, nir_imul_imm(b, blocks, block_size), addr_bits)),
+                nir_imul_imm(b, nir_i2iN(b, nir_isub(b, c.idx, info->row_base.idx),
+                                         addr_bits), block_size));
+   nir_def *block_coord[2], *coord_in_block[2];
+   block_coord[0] = nir_bcsel(b, ok, nir_iadd(b, info->row_base.block_coord[0], blocks),
+                              c.block_coord[0]);
+   block_coord[1] = nir_bcsel(b, ok, info->row_base.block_coord[1], c.block_coord[1]);
+   for (unsigned dim = 0; dim < 2; dim++)
+      coord_in_block[dim] = nir_bcsel(b, ok, info->row_base.coord_in_block[dim],
+                                      c.coord_in_block[dim]);
+
+   nir_deref_instr *bytes =
+      nir_build_deref_cast(b, info->row_base.block, base->modes, glsl_uint8_t_type(), 1);
+   bytes = nir_build_deref_ptr_as_array(b, bytes, step);
+   nir_def *block;
+   nir_def *val = tensor_decode(b, info, &bytes->def, base->modes,
+                                nir_imm_intN_t(b, 0, addr_bits),
+                                block_coord, coord_in_block, &block);
+   info->row_base.delta = row_delta;
+   info->row_base.block = block;
+   info->row_base.idx = c.idx;
+   for (unsigned dim = 0; dim < 2; dim++) {
+      info->row_base.block_coord[dim] = block_coord[dim];
+      info->row_base.coord_in_block[dim] = coord_in_block[dim];
+   }
+   return val;
+}

@@ -2109,6 +2109,8 @@ struct stage_generic_iter {
    nir_deref_instr *base;
    nir_variable *tile;
    nir_def *li;
+   /* Where the first run of the invocation is */
+   nir_def *in0, *out0;
    unsigned wg_size;
    unsigned offset;
    unsigned run;
@@ -2140,14 +2142,29 @@ stage_fill_generic_iter(nir_builder *b, struct stage_load *sl,
    const unsigned unroll = it->unroll, runs = it->runs;
    const bool exact = it->exact, vec_decode = it->vec_decode;
 
-   for (unsigned u = 0; u < unroll; u++) {
-      nir_def *r = nir_iadd(b, li, nir_imul_imm(b, nir_iadd_imm(b, nir_imul_imm(b, j, unroll), u),
-                                                wg_size));
-      nir_if *tail = exact ? NULL : nir_push_if(b, nir_ult_imm(b, r, runs));
-      nir_def *e = nir_imul_imm(b, r, run);
+   /* With whole lines per step, every run of an invocation is in the same
+    * column, a constant number of lines after its first.
+    */
+   const bool lines = exact && nir_src_is_const(nir_src_for_ssa(j)) &&
+                      (wg_size * run) % l.inner == 0;
+   nir_def *in0 = it->in0, *out0 = it->out0;
 
-      nir_def *in = nir_iand_imm(b, e, l.inner - 1);
-      nir_def *out = nir_ushr_imm(b, e, util_logbase2(l.inner));
+   for (unsigned u = 0; u < unroll; u++) {
+      nir_def *in, *out;
+      unsigned out_delta = 0;
+      nir_if *tail = NULL;
+      if (lines) {
+         out_delta = (nir_src_as_uint(nir_src_for_ssa(j)) * unroll + u) * (wg_size * run / l.inner);
+         in = in0;
+         out = nir_iadd_imm(b, out0, out_delta);
+      } else {
+         nir_def *r = nir_iadd(b, li, nir_imul_imm(b, nir_iadd_imm(b, nir_imul_imm(b, j, unroll), u),
+                                                   wg_size));
+         tail = exact ? NULL : nir_push_if(b, nir_ult_imm(b, r, runs));
+         nir_def *e = nir_imul_imm(b, r, run);
+         in = nir_iand_imm(b, e, l.inner - 1);
+         out = nir_ushr_imm(b, e, util_logbase2(l.inner));
+      }
       nir_def *row = l.col_major ? in : out;
       nir_def *col = l.col_major ? out : in;
 
@@ -2163,7 +2180,9 @@ stage_fill_generic_iter(nir_builder *b, struct stage_load *sl,
       } else if (vec_decode) {
          nir_deref_instr *iter_deref = base;
          info->use_vec_decode = true;
-         nir_def *val = nir_calc_tensor_derefs(b, info, row, col, &iter_deref);
+         nir_def *val = lines && !l.col_major ?
+            nir_calc_tensor_decode_rows(b, info, base, out0, out_delta, in0) :
+            nir_calc_tensor_derefs(b, info, row, col, &iter_deref);
          info->use_vec_decode = false;
          if (vals_out)
             vals_out[(*n)++] = val;
@@ -2261,9 +2280,13 @@ stage_generic_plan_init(nir_builder *b, struct stage_load *sl, nir_variable *til
    plan->prefetch = plan->unrolled && exact && !tl.tensor_view &&
                     plan->iters * unroll <= STAGE_MAX_PREFETCH_RUNS;
 
+   nir_def *li = nir_load_local_invocation_index(b);
+   nir_def *e0 = nir_imul_imm(b, li, run);
    plan->it = (struct stage_generic_iter) {
-      .info = info, .base = sl->base, .tile = tile,
-      .li = nir_load_local_invocation_index(b), .wg_size = wg_size,
+      .info = info, .base = sl->base, .tile = tile, .li = li,
+      .in0 = nir_iand_imm(b, e0, l.inner - 1),
+      .out0 = nir_ushr_imm(b, e0, util_logbase2(l.inner)),
+      .wg_size = wg_size,
       .offset = sl->offset, .run = run, .unroll = unroll, .runs = runs,
       .exact = exact, .vec_decode = vec_decode,
    };
@@ -2275,6 +2298,7 @@ stage_generic_values(nir_builder *b, struct stage_load *sl,
                      const struct stage_generic_plan *plan, nir_def **vals)
 {
    unsigned n = 0;
+   sl->info.row_base.row = NULL;
    for (unsigned j = 0; j < plan->iters; j++)
       stage_fill_generic_iter(b, sl, &plan->it, nir_imm_int(b, j), vals, NULL, &n);
 }
@@ -2320,6 +2344,7 @@ stage_fill_generic(nir_builder *b, struct stage_load *sl, nir_variable *tile,
    stage_generic_plan_init(b, sl, tile, wg_size, &plan);
 
    if (plan.unrolled) {
+      sl->info.row_base.row = NULL;
       for (unsigned j = 0; j < plan.iters; j++)
          stage_fill_generic_iter(b, sl, &plan.it, nir_imm_int(b, j), NULL, NULL, NULL);
    } else {
