@@ -1352,6 +1352,12 @@ struct fast_tensor {
    nir_def *stride;
    /* 16-byte aligned and readable, for loads made whether or not ok */
    nir_def *safe_addr;
+   /* With constant clamping: like ok, but the tile may run past the end of
+    * the tensor, and lim0/lim1 are how many of its rows/columns (in tensor
+    * order) are inside.  NULL without clamping.
+    */
+   nir_def *edge_ok;
+   nir_def *lim0, *lim1;
    enum gl_access_qualifier access;
 };
 
@@ -1398,13 +1404,20 @@ fast_tensor_init(nir_builder *b, const struct nir_calc_tensor_info *info,
       ok = nir_iand(b, ok, nir_uge_imm(b, info->clip_col_span, cols));
    }
 
+   nir_def *edge_ok = NULL;
+   ft->lim0 = ft->lim1 = NULL;
    if (info->clamp_mode == NIR_TENSOR_CLAMP_CONSTANT) {
       ok = nir_iand(b, ok, nir_ige_imm(b, off0, 0));
       ok = nir_iand(b, ok, nir_ige_imm(b, off1, 0));
-      ok = nir_iand(b, ok, nir_uge(b, nir_channel(b, info->layout_dims, 0),
-                                   nir_iadd(b, off0, span0)));
-      ok = nir_iand(b, ok, nir_uge(b, nir_channel(b, info->layout_dims, 1),
-                                   nir_iadd(b, off1, span1)));
+      ft->lim0 = nir_usub_sat(b, nir_channel(b, info->layout_dims, 0), off0);
+      ft->lim1 = nir_usub_sat(b, nir_channel(b, info->layout_dims, 1), off1);
+      /* Runs of align_elems along t1 are either all inside or all outside */
+      nir_def *lim1_aligned =
+         nir_ieq_imm(b, nir_iand_imm(b, ft->lim1, align_elems - 1), 0);
+      edge_ok = nir_iand(b, ok, nir_ior(b, nir_uge(b, ft->lim1, span1),
+                                           lim1_aligned));
+      ok = nir_iand(b, ok, nir_uge(b, ft->lim0, span0));
+      ok = nir_iand(b, ok, nir_uge(b, ft->lim1, span1));
    }
 
    nir_def *elem = nir_iadd(b, nir_imul(b, off0, stride), off1);
@@ -1429,11 +1442,14 @@ fast_tensor_init(nir_builder *b, const struct nir_calc_tensor_info *info,
          nir_ior(b, nir_iand_imm(b, nir_u2u32(b, addr), align_elems * elem_bytes - 1),
                     nir_iand_imm(b, stride, align_elems - 1));
       ok = nir_iand(b, ok, nir_ieq_imm(b, misaligned, 0));
+      if (edge_ok)
+         edge_ok = nir_iand(b, edge_ok, nir_ieq_imm(b, misaligned, 0));
    }
 
    nir_variable *var = nir_deref_instr_get_variable(deref);
    ft->access = var ? var->data.access : 0;
    ft->ok = ok;
+   ft->edge_ok = edge_ok;
    ft->addr = addr;
    ft->stride = stride;
    return true;
@@ -1478,7 +1494,7 @@ tensor_piece_origin(nir_builder *b, const struct nir_calc_tensor_info *info,
 static void
 fast_tensor_load_store(nir_builder *b, const struct nir_calc_tensor_info *info,
                        const struct fast_tensor *ft, bool is_load,
-                       nir_def **vals)
+                       nir_def *clamp, nir_def **vals)
 {
    const struct glsl_cmat_description desc = info->desc;
    const unsigned length = get_cmat_length(desc);
@@ -1500,17 +1516,33 @@ fast_tensor_load_store(nir_builder *b, const struct nir_calc_tensor_info *info,
    for (unsigned i = 0; i < length; i += run) {
       unsigned r, c;
       cmat_coord_imm(desc, 0, i, &r, &c);
-      nir_def *addr = fast_tensor_addr(b, ft, nir_iadd_imm(b, row0, r),
-                                       nir_iadd_imm(b, col0, c), elem_bytes);
+      nir_def *row = nir_iadd_imm(b, row0, r);
+      nir_def *col = nir_iadd_imm(b, col0, c);
+      nir_def *addr = fast_tensor_addr(b, ft, row, col, elem_bytes);
       const unsigned bits = run * bit_size;
       const unsigned comps = DIV_ROUND_UP(bits, 32);
       if (is_load) {
+         /* Past the edge of the tensor: load somewhere safe, use the clamp
+          * value.
+          */
+         nir_def *inside = NULL;
+         if (clamp) {
+            nir_def *t0 = ft->transpose ? col : row;
+            nir_def *t1 = ft->transpose ? row : col;
+            nir_def *t1_end = nir_iadd_imm(b, t1, run - 1);
+            inside = nir_iand(b, nir_ult(b, t0, ft->lim0),
+                                 nir_ult(b, t1_end, ft->lim1));
+            addr = nir_bcsel(b, inside, addr, ft->safe_addr);
+         }
          nir_def *v = nir_load_global(b, comps, MIN2(bits, 32), addr,
                                       .align_mul = run * elem_bytes,
                                       .access = ft->access);
          v = nir_extract_bits(b, &v, 1, 0, run, bit_size);
-         for (unsigned j = 0; j < run; j++)
+         for (unsigned j = 0; j < run; j++) {
             vals[i + j] = nir_channel(b, v, j);
+            if (inside)
+               vals[i + j] = nir_bcsel(b, inside, vals[i + j], clamp);
+         }
       } else {
          nir_def *v = nir_vec(b, &vals[i], run);
          v = nir_extract_bits(b, &v, 1, 0, comps, MIN2(bits, 32));
@@ -1555,8 +1587,11 @@ lower_cmat_tensor_load_store(nir_builder *b, nir_cmat_call_instr *call)
    nir_if *fast_if = NULL;
    if (fast_tensor_init(b, &info, deref, orig_desc.rows, orig_desc.cols,
                         bit_size / 8, cmat_group_size(desc), &ft)) {
-      fast_if = nir_push_if(b, ft.ok);
-      fast_tensor_load_store(b, &info, &ft, is_load, vals);
+      /* Loads can take the tile across the edge of the tensor, too */
+      const bool edge = is_load && ft.edge_ok;
+      fast_if = nir_push_if(b, edge ? ft.edge_ok : ft.ok);
+      nir_def *clamp = edge ? nir_u2uN(b, info.clamp_value, bit_size) : NULL;
+      fast_tensor_load_store(b, &info, &ft, is_load, clamp, vals);
       nir_push_else(b, fast_if);
    }
 
