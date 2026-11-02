@@ -3308,10 +3308,17 @@ impl<'a> ShaderFromNir<'a> {
                 let size_B =
                     (intrin.def.bit_size() / 8) * intrin.def.num_components();
                 assert!(u32::from(size_B) <= intrin.align());
+                // Only coherent and volatile loads have to see other
+                // workgroups' stores without a barrier.  The rest can be
+                // weak and cached in L1: acquire barriers invalidate it.
                 let order = if intrin.access() & ACCESS_CAN_REORDER != 0 {
                     MemOrder::Constant
-                } else {
+                } else if intrin.access() & (ACCESS_COHERENT | ACCESS_VOLATILE)
+                    != 0
+                {
                     MemOrder::Strong(MemScope::GPU)
+                } else {
+                    MemOrder::Weak
                 };
                 let access = MemAccess {
                     mem_type: MemType::from_size(size_B, false),
