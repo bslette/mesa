@@ -264,11 +264,41 @@ impl PrmtPass {
         self.add_prmt(op);
     }
 
-    fn run(&mut self, f: &mut Function) {
+    /// I2F reads any byte of its source register for 8-bit types, so an
+    /// OpPrmt that only moves that byte down is free to skip.
+    fn opt_i2f(&mut self, op: &mut OpI2F) {
+        if op.src_type.bits() != 8
+            || op.src_byte != 0
+            || !op.src.is_unmodified()
+            || op.dst.file() != Some(RegFile::GPR)
+        {
+            return;
+        }
+        let Some(src_prmt) = self.get_prmt_for_src(&op.src) else {
+            return;
+        };
+        let sel = src_prmt.sel.get(0);
+        if sel.msb() {
+            return;
+        }
+        let src = &src_prmt.srcs[sel.src()];
+        let SrcRef::SSA(vec) = src else {
+            return;
+        };
+        if vec.comps() != 1 || vec[0].file() != RegFile::GPR {
+            return;
+        }
+        op.src = src.clone().into();
+        op.src_byte = sel.byte() as u8;
+    }
+
+    fn run(&mut self, f: &mut Function, fold_i2f: bool) {
         for b in &mut f.blocks {
             for instr in &mut b.instrs {
-                if let Op::Prmt(op) = &mut instr.op {
-                    self.opt_prmt(op);
+                match &mut instr.op {
+                    Op::Prmt(op) => self.opt_prmt(op),
+                    Op::I2F(op) if fold_i2f => self.opt_i2f(op),
+                    _ => (),
                 }
             }
         }
@@ -277,8 +307,9 @@ impl PrmtPass {
 
 impl Shader<'_> {
     pub fn opt_prmt(&mut self) {
+        let fold_i2f = self.sm.sm() >= 70;
         for f in &mut self.functions {
-            PrmtPass::new().run(f);
+            PrmtPass::new().run(f, fold_i2f);
         }
     }
 }

@@ -1431,6 +1431,7 @@ impl<'a> ShaderFromNir<'a> {
                     dst_type: dst_type,
                     src_type: IntType::from_bits(src_bits.into(), true),
                     rnd_mode: self.float_ctl[dst_type].rnd_mode,
+                    src_byte: 0,
                 });
                 dst
             }
@@ -1766,6 +1767,7 @@ impl<'a> ShaderFromNir<'a> {
                     dst_type: dst_type,
                     src_type: IntType::from_bits(src_bits.into(), false),
                     rnd_mode: self.float_ctl[dst_type].rnd_mode,
+                    src_byte: 0,
                 });
                 dst
             }
@@ -2428,6 +2430,7 @@ impl<'a> ShaderFromNir<'a> {
                                     src_type,
                                     dst_type,
                                     rnd_mode,
+                                    src_byte: 0,
                                 });
                             }
                             ALUType::FLOAT => {

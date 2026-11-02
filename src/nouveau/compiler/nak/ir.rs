@@ -4822,6 +4822,9 @@ pub struct OpI2F {
     pub dst_type: FloatType,
     pub src_type: IntType,
     pub rnd_mode: FRndMode,
+
+    /// For 8-bit sources, the byte of the source register to convert
+    pub src_byte: u8,
 }
 
 impl SrcsAsSlice for OpI2F {
@@ -4867,7 +4870,11 @@ impl DisplayOp for OpI2F {
             f,
             "i2f{}{}{} {}",
             self.dst_type, self.src_type, self.rnd_mode, self.src,
-        )
+        )?;
+        if self.src_byte != 0 {
+            write!(f, ".b{}", self.src_byte)?;
+        }
+        Ok(())
     }
 }
 impl_display_for_op!(OpI2F);

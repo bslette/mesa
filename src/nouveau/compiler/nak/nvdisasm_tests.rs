@@ -1670,6 +1670,7 @@ pub fn test_float_ops() {
                     src_type: IntType::U32,
                     dst_type: FloatType::F64,
                     rnd_mode,
+                    src_byte: 0,
                 };
                 let disasm = format!("i2f.f64.u32{rnd_mode_str} r1, r2;");
                 c.push(instr, disasm);
@@ -1680,6 +1681,7 @@ pub fn test_float_ops() {
                     src_type: IntType::U32,
                     dst_type: FloatType::F16,
                     rnd_mode,
+                    src_byte: 0,
                 };
                 let disasm = format!("i2f.f16.u32{rnd_mode_str} r1, r2;");
                 c.push(instr, disasm);
@@ -1718,6 +1720,7 @@ pub fn test_float_ops() {
                         src_type: IntType::U32,
                         dst_type: FloatType::F16,
                         rnd_mode,
+                        src_byte: 0,
                     };
                     let disasm =
                         format!("ui2f.f16.u32{rnd_mode_str} ur1, ur2;");

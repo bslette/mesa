@@ -2360,7 +2360,8 @@ impl SM70Op for OpI2F {
             };
         }
 
-        e.set_field(60..62, 0_u8); // TODO: subop
+        assert!(self.src_byte == 0 || self.src_type.bits() == 8);
+        e.set_field(60..62, self.src_byte);
         e.set_bit(74, self.src_type.is_signed());
         e.set_field(75..77, (self.dst_type.bits() / 8).ilog2());
         e.set_rnd_mode(78..80, self.rnd_mode);
