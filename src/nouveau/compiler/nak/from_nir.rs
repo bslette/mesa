@@ -3676,7 +3676,18 @@ impl<'a> ShaderFromNir<'a> {
                     }
                     _ => panic!("Unhandled execution scope"),
                 }
-                if intrin.memory_scope() != SCOPE_NONE {
+                // BAR.SYNC already orders the memory accesses of the threads
+                // it waits for (CUDA's __syncthreads() is a bare BAR.SYNC),
+                // so a workgroup barrier over shared memory alone needs no
+                // MEMBAR.
+                let bar_orders_mem = self.sm.sm() >= 70
+                    && intrin.execution_scope() == SCOPE_WORKGROUP
+                    && matches!(
+                        intrin.memory_scope(),
+                        SCOPE_INVOCATION | SCOPE_SUBGROUP | SCOPE_WORKGROUP
+                    )
+                    && (modes & !nir_var_mem_shared) == 0;
+                if intrin.memory_scope() != SCOPE_NONE && !bar_orders_mem {
                     let mem_scope = match intrin.memory_scope() {
                         SCOPE_INVOCATION | SCOPE_SUBGROUP => MemScope::CTA,
                         // A membar.gpu is very expensive so use .cta whenever
