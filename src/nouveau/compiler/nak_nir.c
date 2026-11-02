@@ -7,6 +7,7 @@
 #include "nir_builder.h"
 #include "nir_control_flow.h"
 #include "nir_xfb_info.h"
+#include "util/u_dynarray.h"
 
 #include "util/u_math.h"
 
@@ -1457,7 +1458,8 @@ nak_nir_lower_load_store(nir_shader *nir, const struct nak_compiler *nak)
                res = nir_load_shared_nv(&b, intr->def.num_components, intr->def.bit_size, addr->ssa, uaddr);
                break;
             case nir_intrinsic_store_global:
-               new = nir_store_global_nv(&b, intr->src[0].ssa, addr->ssa, uaddr);
+               new = nir_store_global_nv(&b, intr->src[0].ssa, addr->ssa, uaddr,
+                                         nir_imm_true(&b));
                break;
             case nir_intrinsic_store_scratch:
                new = nir_store_scratch_nv(&b, intr->src[0].ssa, addr->ssa, uaddr);
@@ -2126,6 +2128,100 @@ nak_nir_interleave_cmat_mma(nir_shader *nir)
    return progress;
 }
 
+/* Whether an if is only a few stores and the arithmetic they need */
+static bool
+if_is_predicatable(nir_if *nif)
+{
+   if (!nir_cf_list_is_empty_block(&nif->else_list) ||
+       exec_list_length(&nif->then_list) != 1)
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+   if (nir_block_first_instr(after) &&
+       nir_block_first_instr(after)->type == nir_instr_type_phi)
+      return false;
+
+   unsigned num_instrs = 0, num_stores = 0;
+   nir_foreach_instr(instr, then_block) {
+      if (++num_instrs > 64)
+         return false;
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_store_global_nv) {
+            num_stores++;
+            break;
+         }
+         /* A constant buffer read at a constant index and offset can't
+          * fault: that is where the buffer addresses come from.
+          */
+         if (intr->intrinsic != nir_intrinsic_ldc_nv ||
+             !nir_src_is_const(intr->src[0]) ||
+             !nir_src_is_const(intr->src[1]))
+            return false;
+         break;
+      }
+      default:
+         return false;
+      }
+   }
+   return num_stores > 0;
+}
+
+/* Branches around a few stores, like the bounds checks of per-element
+ * matrix callbacks, cost a divergent branch and a reconvergence barrier
+ * each: flash attention's output store was 64 of them per invocation.
+ * Move the arithmetic out of the if and predicate the stores instead, as
+ * the NVIDIA driver does.
+ */
+static bool
+nak_nir_predicate_small_ifs(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      struct util_dynarray ifs;
+      util_dynarray_init(&ifs, NULL);
+      nir_foreach_block(block, impl) {
+         nir_if *nif = nir_block_get_following_if(block);
+         if (nif && if_is_predicatable(nif))
+            util_dynarray_append(&ifs, nif);
+      }
+
+      nir_builder b = nir_builder_create(impl);
+      util_dynarray_foreach(&ifs, nir_if *, nifp) {
+         nir_if *nif = *nifp;
+         nir_def *cond = nif->condition.ssa;
+         nir_block *then_block = nir_if_first_then_block(nif);
+
+         nir_foreach_instr(instr, then_block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_store_global_nv)
+               continue;
+            nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&store->src[3], nir_iand(&b, cond, store->src[3].ssa));
+         }
+
+         nir_cf_list body;
+         nir_cf_extract(&body, nir_before_block(then_block),
+                        nir_after_block(then_block));
+         nir_cf_reinsert(&body, nir_before_cf_node(&nif->cf_node));
+         nir_cf_node_remove(&nif->cf_node);
+      }
+
+      progress |= nir_progress(ifs.size > 0, impl, nir_metadata_none);
+      util_dynarray_fini(&ifs);
+   }
+   return progress;
+}
+
 /* Moves global loads up their block, with the address math they need, as
  * far as fences allow.  Cooperative matrix loops load the next tile right
  * after the multiplies of the previous one (see the tensor load staging);
@@ -2403,6 +2499,12 @@ nak_postprocess_nir(nir_shader *nir,
       }
    } while (progress);
 
+   if (nak->sm >= 70 && OPT(nir, nak_nir_predicate_small_ifs)) {
+      /* An if around a predicated one may be predicatable now */
+      while (OPT(nir, nak_nir_predicate_small_ifs));
+      OPT(nir, nir_opt_constant_folding);
+      OPT(nir, nir_opt_dce);
+   }
    OPT(nir, nir_opt_move, nir_move_comparisons | nir_move_load_ubo);
    if (nir->info.stage == MESA_SHADER_COMPUTE &&
        nir->info.cs.has_cooperative_matrix)

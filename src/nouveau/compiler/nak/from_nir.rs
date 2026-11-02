@@ -3889,8 +3889,13 @@ impl<'a> ShaderFromNir<'a> {
                 };
                 let addr = self.get_src(&srcs[1]);
                 let uaddr = self.get_src(&srcs[2]);
+                let pred_src = self.get_src(&srcs[3]);
+                let pred: Pred = match pred_src.as_bool() {
+                    Some(c) => c.into(),
+                    None => pred_src.to_ssa()[0].into(),
+                };
 
-                b.push_op(OpSt {
+                b.predicate(pred).push_op(OpSt {
                     addr: addr,
                     uniform_addr: uaddr,
                     data: data,
