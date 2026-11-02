@@ -1978,6 +1978,154 @@ nak_nir_sink_shared_cmat_loads(nir_shader *nir)
    return progress;
 }
 
+static bool
+is_cmat_mma(nir_instr *instr)
+{
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_cmat_muladd_nv;
+}
+
+/* What may move up between MMAs: arithmetic and loads, nothing that
+ * writes or synchronizes.
+ */
+static bool
+can_interleave_with_mma(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu:
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      return intr->intrinsic != nir_intrinsic_barrier &&
+             (nir_intrinsic_infos[intr->intrinsic].flags & NIR_INTRINSIC_CAN_ELIMINATE);
+   }
+   default:
+      return false;
+   }
+}
+
+struct interleave_state {
+   nir_block *block;
+   /* Instructions after this index are the ones moving */
+   unsigned last_mma;
+   /* The latest source that stays, and the latest that moves */
+   unsigned max_index;
+   unsigned max_moving;
+};
+
+static bool
+latest_src_index(nir_src *src, void *data)
+{
+   struct interleave_state *state = data;
+   nir_instr *parent = nir_def_instr(src->ssa);
+   if (parent->block != state->block)
+      return true;
+   if (parent->index > state->last_mma)
+      state->max_moving = MAX2(state->max_moving, parent->index);
+   else
+      state->max_index = MAX2(state->max_index, parent->index);
+   return true;
+}
+
+/* Matrix loops leave the arithmetic for the next tile (decoding, fills)
+ * after the MMAs of this one, and issue is in order: the tensor pipe then
+ * sits idle while it runs, the more so as barriers keep all subgroups in
+ * step.  The pre-RA scheduler doesn't reorder those blocks (they're too
+ * close to the register limit for it), so spread that work evenly between
+ * the MMAs, each instruction no earlier than its sources.
+ */
+static bool
+nak_nir_interleave_cmat_mma(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         index_block_instrs(block);
+
+         nir_instr *mmas[1024];
+         unsigned num_mmas = 0;
+         bool ok = true;
+         nir_foreach_instr(instr, block) {
+            if (is_cmat_mma(instr)) {
+               if (num_mmas == ARRAY_SIZE(mmas)) {
+                  ok = false;
+                  break;
+               }
+               mmas[num_mmas++] = instr;
+            }
+         }
+         if (!ok || num_mmas < 16)
+            continue;
+
+         /* Nothing between the MMAs may write or synchronize */
+         for (nir_instr *i = mmas[0]; i != mmas[num_mmas - 1]; i = nir_instr_next(i)) {
+            if (!is_cmat_mma(i) && !can_interleave_with_mma(i)) {
+               ok = false;
+               break;
+            }
+         }
+         if (!ok)
+            continue;
+
+         /* The work after the last MMA, up to the first thing that can't move */
+         nir_instr *movable[2048];
+         unsigned num_movable = 0;
+         for (nir_instr *i = nir_instr_next(mmas[num_mmas - 1]);
+              i && can_interleave_with_mma(i) && num_movable < ARRAY_SIZE(movable);
+              i = nir_instr_next(i))
+            movable[num_movable++] = i;
+         if (num_movable < num_mmas / 4)
+            continue;
+
+         /* Instruction j goes after an MMA of the second half in proportion,
+          * or after its last source if that is later.
+          */
+         unsigned *slot_of = calloc(num_movable, sizeof(*slot_of));
+         nir_instr **slot_last = calloc(num_mmas, sizeof(*slot_last));
+         for (unsigned j = 0; j < num_movable; j++) {
+            nir_instr *instr = movable[j];
+            struct interleave_state state = {
+               .block = block,
+               .last_mma = mmas[num_mmas - 1]->index,
+            };
+            nir_foreach_src(instr, latest_src_index, &state);
+
+            /* The second half only: the work often decodes what the global
+             * loads at the top of the block fetch, and in order issue
+             * would wait for them in the middle of the MMAs.
+             */
+            const unsigned half = num_mmas / 2;
+            unsigned slot = half + (uint64_t)j * (num_mmas - half) / num_movable;
+            /* After every source that stays... */
+            while (slot < num_mmas - 1 && mmas[slot]->index < state.max_index)
+               slot++;
+            /* ...and with or after every source that moves */
+            for (unsigned k = 0; k < j; k++) {
+               if (movable[k]->index <= state.max_moving)
+                  slot = MAX2(slot, slot_of[k]);
+            }
+            slot_of[j] = slot;
+
+            nir_instr *after = slot_last[slot] ? slot_last[slot] : mmas[slot];
+            if (after != nir_instr_prev(instr)) {
+               nir_instr_remove(instr);
+               nir_instr_insert_after(after, instr);
+               impl_progress = true;
+            }
+            slot_last[slot] = instr;
+         }
+         free(slot_of);
+         free(slot_last);
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 /* Moves global loads up their block, with the address math they need, as
  * far as fences allow.  Cooperative matrix loops load the next tile right
  * after the multiplies of the previous one (see the tensor load staging);
@@ -2262,6 +2410,9 @@ nak_postprocess_nir(nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_COMPUTE &&
        nir->info.cs.has_cooperative_matrix)
       OPT(nir, nak_nir_sink_shared_cmat_loads);
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       nir->info.cs.has_cooperative_matrix)
+      OPT(nir, nak_nir_interleave_cmat_mma);
 
    if (nak->sm < 70) {
       const nir_split_conversions_options split_conv_opts = {
