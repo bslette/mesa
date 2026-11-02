@@ -2099,6 +2099,28 @@ stage_fill_fast_loads(nir_builder *b, struct stage_load *sl, nir_def *ok,
    const unsigned total_vecs = l.inner * l.outer / vec;
    nir_def *li = nir_load_local_invocation_index(b);
 
+   /* With whole rows per step, an invocation's loads are a constant number
+    * of rows apart: pick the safe address once, and step by a stride that
+    * is 0 when ok is false.  The steps are uniform, so each load costs one
+    * 64-bit add instead of an address and a select.
+    */
+   if (wg_size % row_vecs == 0 && total_vecs % wg_size == 0) {
+      const unsigned step_rows = wg_size / row_vecs;
+      nir_def *in = nir_imul_imm(b, nir_iand_imm(b, li, row_vecs - 1), vec);
+      nir_def *out = nir_ushr_imm(b, li, util_logbase2(row_vecs));
+      nir_def *addr0 = fast_tensor_addr(b, &sl->ft, l.col_major ? in : out,
+                                        l.col_major ? out : in, elem_bytes);
+      addr0 = nir_bcsel(b, ok, addr0, sl->ft.safe_addr);
+      nir_def *stride = nir_bcsel(b, ok, sl->ft.stride, nir_imm_int(b, 0));
+      for (unsigned n = 0; n < total_vecs / wg_size; n++) {
+         nir_def *off = nir_u2u64(b, nir_imul_imm(b, stride, n * step_rows));
+         nir_def *addr = nir_iadd(b, addr0, nir_imul_imm(b, off, elem_bytes));
+         vals[n] = nir_load_global(b, 4, 32, addr, .align_mul = 16,
+                                   .access = sl->ft.access);
+      }
+      return;
+   }
+
    for (unsigned v0 = 0, n = 0; v0 < total_vecs; v0 += wg_size, n++) {
       nir_def *v = nir_iadd_imm(b, li, v0);
       if (v0 + wg_size > total_vecs)
