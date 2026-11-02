@@ -107,6 +107,13 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
                 g.add_edge(ip, w_ip, EdgeLabel { latency });
             }
         });
+        // The predicate guarding the instruction is a read too: a later
+        // write of it must stay after.  It's read at issue.
+        uses.for_each_instr_pred_mut(instr, |u| {
+            if let Some((w_ip, _)) = u.write {
+                g.add_edge(ip, w_ip, EdgeLabel { latency: 1 });
+            }
+        });
 
         // We're iterating in reverse, so writes are logically first
         uses.for_each_instr_dst_mut(instr, |i, c| {
