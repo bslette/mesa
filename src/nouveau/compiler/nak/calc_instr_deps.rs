@@ -725,39 +725,13 @@ fn insert_texture_barriers(f: &mut Function, sm: &ShaderModelInfo) {
     }
 }
 
-/// Whether instr is a branch that only goes forward in block order
-fn is_forward_branch(f: &Function, bi: usize, instr: &Instr) -> bool {
-    matches!(instr.op, Op::Bra(_))
-        && f.blocks.succ_indices(bi).iter().all(|&s| s > bi)
-}
-
 fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
     let mut uses = Box::new(RegTracker::new_with(&|| RegUse::None));
     let mut deps = DepGraph::new();
 
-    // Barriers are tracked through the blocks in order.  A forward branch
-    // doesn't wait on everything outstanding: the blocks it skips are
-    // tracked as if they ran, and its targets wait on whatever was busy at
-    // the branch and has been freed (waited on) since.  Back edges and exits
-    // still wait on everything.
-    let fwd_branches = std::env::var_os("NAK_BRANCH_WAIT_ALL").is_none();
-    let succs: Vec<Vec<usize>> = (0..f.blocks.len())
-        .map(|bi| f.blocks.succ_indices(bi).to_vec())
-        .collect();
-    let is_fwd: Vec<bool> = (0..f.blocks.len())
-        .map(|bi| {
-            fwd_branches
-                && f.blocks[bi]
-                    .instrs
-                    .last()
-                    .is_some_and(|i| is_forward_branch(f, bi, i))
-        })
-        .collect();
-
     for (bi, b) in f.blocks.iter().enumerate() {
-        let num_instrs = b.instrs.len();
         for (ip, instr) in b.instrs.iter().enumerate() {
-            if instr.is_branch() && !(is_fwd[bi] && ip + 1 == num_instrs) {
+            if instr.is_branch() {
                 deps.add_barrier(bi, ip);
             } else {
                 // Execution predicates are handled immediately and we don't
@@ -811,40 +785,9 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
 
     let mut bars = BarAlloc::new();
 
-    // The dependencies on each barrier at the forward branches to a block
-    let mut join_deps: Vec<Option<[Vec<usize>; 6]>> =
-        vec![None; f.blocks.len()];
-
     for (bi, b) in f.blocks.iter_mut().enumerate() {
-        // Barriers busy at a branch here whose dependencies have been
-        // waited on since: on the path from the branch they may not be done.
-        let mut join_wait = 0_u8;
-        if let Some(jd) = join_deps[bi].take() {
-            if b.instrs.is_empty() {
-                // Nothing to wait with here: pass it on to the next block,
-                // which this one falls through to.
-                if bi + 1 < join_deps.len() {
-                    let next = join_deps[bi + 1].get_or_insert_with(Default::default);
-                    for bar in 0..6 {
-                        next[bar].extend_from_slice(&jd[bar]);
-                    }
-                }
-                continue;
-            }
-            for bar in 0..bars.num_bars {
-                let cur = &bars.bar_deps[usize::from(bar)];
-                if jd[usize::from(bar)].iter().any(|d| !cur.contains(d)) {
-                    join_wait |= 1 << bar;
-                    if !bars.bar_is_free(bar) {
-                        bars.free_bar(bar);
-                    }
-                }
-            }
-        }
-
-        let num_instrs = b.instrs.len();
         for (ip, instr) in b.instrs.iter_mut().enumerate() {
-            let mut wait_mask = if ip == 0 { join_wait } else { 0_u8 };
+            let mut wait_mask = 0_u8;
             for dep in deps.get_instr_waits(bi, ip) {
                 if let Some(bar) = bars.get_bar_for_dep(*dep) {
                     wait_mask |= 1 << bar;
@@ -855,19 +798,6 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
 
             if instr.needs_yield() {
                 instr.deps.set_yield(true);
-            }
-
-            if is_fwd[bi] && ip + 1 == num_instrs {
-                for &s in &succs[bi] {
-                    if s == bi + 1 {
-                        // Falls through: tracked in order
-                        continue;
-                    }
-                    let jd = join_deps[s].get_or_insert_with(Default::default);
-                    for bar in 0..6 {
-                        jd[bar].extend_from_slice(&bars.bar_deps[bar]);
-                    }
-                }
             }
 
             if !sm.op_needs_scoreboard(&instr.op) {
