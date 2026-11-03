@@ -88,9 +88,12 @@ for op in ['fcos_normalized_2_pi', 'flog2', 'frsq', 'fsin_normalized_2_pi', 'fsq
             'nak->sm >= 73 && ' + fp16_round_is_rtz),
     ]
 
-# If contract is on we can always remove the conversions
+# If contract is on we can remove the conversions around a round-towards-zero
+# conversion.  Not around a round-to-nearest one: mufu.f16 rounds towards
+# zero, so half the results would be one f16 ulp low (e.g. sqrt in f32 then
+# stored to f16, as llama.cpp's f16 SQRT does).
 for op in ['fcos_normalized_2_pi', 'fexp2', 'flog2', 'frcp', 'frsq', 'fsin_normalized_2_pi', 'fsqrt']:
-    for f2f16 in ['f2f16_rtz', 'f2f16_rtne', 'f2f16']:
+    for f2f16 in ['f2f16_rtz']:
         algebraic_lowering += [
             ((f2f16 + '(contract)', (op + '(is_used_once)', ('f2f32', 'a@16'))),
                 (op, a), 'nak->sm >= 73'),
