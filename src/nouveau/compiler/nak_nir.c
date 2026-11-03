@@ -2137,12 +2137,8 @@ if_is_predicatable(nir_if *nif)
       return false;
 
    nir_block *then_block = nir_if_first_then_block(nif);
-   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
-   if (nir_block_first_instr(after) &&
-       nir_block_first_instr(after)->type == nir_instr_type_phi)
-      return false;
 
-   unsigned num_instrs = 0, num_stores = 0;
+   unsigned num_instrs = 0, num_mem = 0;
    nir_foreach_instr(instr, then_block) {
       if (++num_instrs > 64)
          return false;
@@ -2153,8 +2149,12 @@ if_is_predicatable(nir_if *nif)
          break;
       case nir_instr_type_intrinsic: {
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic == nir_intrinsic_store_global_nv) {
-            num_stores++;
+         /* Both take a condition that makes them do nothing (a load
+          * returns 0 then)
+          */
+         if (intr->intrinsic == nir_intrinsic_store_global_nv ||
+             intr->intrinsic == nir_intrinsic_load_global_nv) {
+            num_mem++;
             break;
          }
          /* A constant buffer read at a constant index and offset can't
@@ -2170,14 +2170,16 @@ if_is_predicatable(nir_if *nif)
          return false;
       }
    }
-   return num_stores > 0;
+   return num_mem > 0;
 }
 
-/* Branches around a few stores, like the bounds checks of per-element
- * matrix callbacks, cost a divergent branch and a reconvergence barrier
- * each: flash attention's output store was 64 of them per invocation.
- * Move the arithmetic out of the if and predicate the stores instead, as
- * the NVIDIA driver does.
+/* Branches around a few stores or loads, like the bounds checks of
+ * per-element matrix callbacks or of an unrolled loop over a row, cost a
+ * divergent branch and a reconvergence barrier each: flash attention's
+ * output store was 64 of them per invocation, rms_norm's row loads 32.
+ * Move the arithmetic out of the if and predicate the memory accesses
+ * instead, as the NVIDIA driver does.  A predicated-off load returns 0, and
+ * the phis after the if become selects.
  */
 static bool
 nak_nir_predicate_small_ifs(nir_shader *nir)
@@ -2199,20 +2201,64 @@ nak_nir_predicate_small_ifs(nir_shader *nir)
          nir_def *cond = nif->condition.ssa;
          nir_block *then_block = nir_if_first_then_block(nif);
 
+         nir_block *else_block = nir_if_first_else_block(nif);
+         nir_block *after =
+            nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+
          nir_foreach_instr(instr, then_block) {
-            if (instr->type != nir_instr_type_intrinsic ||
-                nir_instr_as_intrinsic(instr)->intrinsic !=
-                   nir_intrinsic_store_global_nv)
+            if (instr->type != nir_instr_type_intrinsic)
                continue;
-            nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned pred_idx;
+            if (intr->intrinsic == nir_intrinsic_store_global_nv)
+               pred_idx = 3;
+            else if (intr->intrinsic == nir_intrinsic_load_global_nv)
+               pred_idx = 2;
+            else
+               continue;
             b.cursor = nir_before_instr(instr);
-            nir_src_rewrite(&store->src[3], nir_iand(&b, cond, store->src[3].ssa));
+            nir_src_rewrite(&intr->src[pred_idx],
+                            nir_iand(&b, cond, intr->src[pred_idx].ssa));
+         }
+
+         /* The else is empty, so its phi sources come from before the if */
+         struct util_dynarray phis;
+         util_dynarray_init(&phis, NULL);
+         nir_foreach_phi(phi, after) {
+            nir_def *then_val = NULL, *else_val = NULL;
+            nir_foreach_phi_src(src, phi) {
+               if (src->pred == then_block)
+                  then_val = src->src.ssa;
+               else if (src->pred == else_block)
+                  else_val = src->src.ssa;
+            }
+            assert(then_val && else_val);
+            util_dynarray_append(&phis, phi);
+            util_dynarray_append(&phis, then_val);
+            util_dynarray_append(&phis, else_val);
          }
 
          nir_cf_list body;
          nir_cf_extract(&body, nir_before_block(then_block),
                         nir_after_block(then_block));
          nir_cf_reinsert(&body, nir_before_cf_node(&nif->cf_node));
+
+         b.cursor = nir_before_cf_node(&nif->cf_node);
+         for (void **v = phis.data; (char *)v < (char *)phis.data + phis.size;
+              v += 3) {
+            nir_phi_instr *phi = v[0];
+            /* NAK's ALU ops are scalar by now */
+            nir_def *then_val = v[1], *else_val = v[2];
+            nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned c = 0; c < phi->def.num_components; c++) {
+               comps[c] = nir_bcsel(&b, cond, nir_channel(&b, then_val, c),
+                                    nir_channel(&b, else_val, c));
+            }
+            nir_def *sel = nir_vec(&b, comps, phi->def.num_components);
+            nir_def_rewrite_uses(&phi->def, sel);
+            nir_instr_remove(&phi->instr);
+         }
+         util_dynarray_fini(&phis);
          nir_cf_node_remove(&nif->cf_node);
       }
 
