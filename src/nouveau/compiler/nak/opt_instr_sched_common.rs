@@ -302,6 +302,11 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         // Memory ops
         Op::Ldc(_) | Op::Ldcg(_) => 4,
 
+        // Global loads go to L2 or memory: the L1 latency below is far too
+        // short for them, and schedules their address math and the loads
+        // too close to the instructions that wait on them.
+        Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)) => 200,
+
         Op::Ld(_)
         | Op::Ldsm(_)
         | Op::Movm(_)
