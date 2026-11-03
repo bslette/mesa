@@ -1542,10 +1542,10 @@ nak_nir_opt_uniform_address_impl(struct nir_builder *b,
 
       assert(nir_src_as_uint(*uniform_offset_src) == 0);
 
-      /* Nak can't collect vectors in non uniform control flow, so don't
-       * even try */
-      if (offset->bit_size == 64 && nak_block_is_divergent(use_block))
-         return false;
+      /* Nak can't collect vectors in non uniform control flow, but
+       * nak_nir_lower_non_uniform_ldcx pins 64-bit uniform addresses it can
+       * hoist out of it.  The others go back to one 64-bit add in legalize.
+       */
 
       /* We ignore any constant offset */
       if (nir_src_is_const(*offset_src))

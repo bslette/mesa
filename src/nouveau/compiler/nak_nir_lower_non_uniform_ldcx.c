@@ -89,6 +89,7 @@ struct non_uniform_section {
    nir_block *pred;
    nir_block *succ;
    struct hash_table *live_handles;
+   unsigned num_global_addrs;
 };
 
 static void
@@ -206,6 +207,24 @@ hoist_def(nir_def *def, nir_block *target)
    return true;
 }
 
+/* The 64-bit uniform address of a global memory access, if it has one */
+static nir_src *
+global_uniform_addr_src(nir_intrinsic_instr *intrin)
+{
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_global_nv:
+   case nir_intrinsic_store_global_nv:
+   case nir_intrinsic_global_atomic_nv: {
+      nir_src *src = nir_get_io_uniform_offset_src(intrin);
+      if (src->ssa->bit_size != 64 || nir_src_is_const(*src))
+         return NULL;
+      return src;
+   }
+   default:
+      return NULL;
+   }
+}
+
 static bool
 try_hoist_ldcx_handles_block(nir_block *block, struct non_uniform_section *nus)
 {
@@ -245,6 +264,30 @@ try_hoist_ldcx_handles_block(nir_block *block, struct non_uniform_section *nus)
 
       case nir_instr_type_intrinsic: {
          nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+
+         /* A uniform base address of global loads and stores (like an SSBO
+          * base address) is a 64-bit uniform value too: pin it the same way,
+          * or every access adds it to its offset in 64 bits.
+          */
+         nir_src *uaddr = global_uniform_addr_src(load);
+         if (uaddr != NULL) {
+            /* A few, so that the other uniform values keep their UGPRs:
+             * running out of them spills them to GPRs.
+             */
+            const unsigned max_global_addrs = 4;
+            bool known =
+               _mesa_hash_table_search(nus->live_handles, uaddr->ssa) != NULL;
+            if (!uaddr->ssa->divergent &&
+                (known || nus->num_global_addrs < max_global_addrs) &&
+                can_hoist_def(uaddr->ssa, nus->pred)) {
+               progress |= hoist_def(uaddr->ssa, nus->pred);
+               add_live_handle(uaddr->ssa, nus);
+               if (!known)
+                  nus->num_global_addrs++;
+            }
+            break;
+         }
+
          if (load->intrinsic != nir_intrinsic_ldcx_nv)
             break;
 
@@ -392,6 +435,20 @@ lower_ldcx_block(nir_builder *b, nir_block *block,
       }
       case nir_instr_type_intrinsic: {
          nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+
+         nir_src *uaddr = global_uniform_addr_src(load);
+         if (uaddr != NULL) {
+            if (nus != NULL) {
+               struct hash_entry *entry =
+                  _mesa_hash_table_search(nus->live_handles, uaddr->ssa);
+               if (entry != NULL && entry->data != uaddr->ssa) {
+                  nir_src_rewrite(uaddr, entry->data);
+                  progress = true;
+               }
+            }
+            break;
+         }
+
          if (load->intrinsic != nir_intrinsic_ldcx_nv)
             break;
 
