@@ -1925,6 +1925,11 @@ impl SM70Op for OpLea {
         let gpr = op_gpr(self);
         b.copy_alu_src_if_not_reg(&mut self.a, gpr, SrcType::ALU);
         if self.dst_high {
+            // LEA.HI can't take a UGPR in src2 (Illegal Instruction
+            // Encoding on Ada), only in src1.
+            if gpr == RegFile::GPR && self.a_high.is_ugpr_reg() {
+                b.copy_alu_src(&mut self.a_high, gpr, SrcType::ALU);
+            }
             b.copy_alu_src_if_both_not_reg(
                 &self.b,
                 &mut self.a_high,
@@ -1981,6 +1986,11 @@ impl SM70Op for OpLeaX {
         let gpr = op_gpr(self);
         b.copy_alu_src_if_not_reg(&mut self.a, gpr, SrcType::ALU);
         if self.dst_high {
+            // LEA.HI can't take a UGPR in src2 (Illegal Instruction
+            // Encoding on Ada), only in src1.
+            if gpr == RegFile::GPR && self.a_high.is_ugpr_reg() {
+                b.copy_alu_src(&mut self.a_high, gpr, SrcType::ALU);
+            }
             b.copy_alu_src_if_both_not_reg(
                 &self.b,
                 &mut self.a_high,
