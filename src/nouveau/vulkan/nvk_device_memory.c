@@ -11,6 +11,7 @@
 #include "nvkmd/nvkmd.h"
 
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 
 #include <inttypes.h>
 #include <sys/mman.h>
@@ -126,6 +127,8 @@ enum nvk_memory_init {
    NVK_MEMORY_INIT_TRASH,
 };
 
+DEBUG_GET_ONCE_BOOL_OPTION(nvk_big_pages, "NVK_BIG_PAGES", true)
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_AllocateMemory(VkDevice device,
                    const VkMemoryAllocateInfo *pAllocateInfo,
@@ -201,6 +204,22 @@ nvk_AllocateMemory(VkDevice device,
          else
             alignment = (1ULL << 16);
       }
+   }
+
+   /* Large device-local buffers are allocated VRAM|GART by default, and the
+    * kernel maps anything that may land in GART with 4K GPU pages.  For
+    * big, unshared buffers (matmul weights and activations for compute),
+    * the resulting TLB pressure costs a few percent, so pin them to VRAM
+    * and align to 2M, which lets the kernel use 2M pages.  The cost is that
+    * these buffers can no longer be evicted to system memory.
+    * NVK_BIG_PAGES=false restores the old placement.
+    */
+   if (mem->dedicated_image == NULL && not_shared &&
+       (type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+       pAllocateInfo->allocationSize >= (1ULL << 21) &&
+       debug_get_option_nvk_big_pages()) {
+      pinned_to_vram = true;
+      alignment = MAX2(alignment, 1ULL << 21);
    }
 
    const enum nvkmd_mem_flags flags =
