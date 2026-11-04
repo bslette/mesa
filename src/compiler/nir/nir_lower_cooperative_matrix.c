@@ -1647,8 +1647,13 @@ split_cmat_load_store(nir_builder *b,
             nir_def *sgid = base_sgid;
 
             struct split_var_info *c_info = find_type_info(info->split_var_info, var->type);
+            /* get_wg_split_offsets() takes the row of A as
+             * (sgid / inner_cols) % inner_rows of A's own box, so hand it
+             * the subgroup's row of C scaled by A's inner_cols.
+             */
             if (desc.use == GLSL_CMAT_USE_A && c_info)
-               sgid = nir_udiv_imm(b, sgid, c_info->c_box.inner_cols);
+               sgid = nir_imul_imm(b, nir_udiv_imm(b, sgid, c_info->c_box.inner_cols),
+                                   split->box.inner_cols);
             else if (desc.use == GLSL_CMAT_USE_B && c_info)
                sgid = nir_umod_imm(b, sgid, c_info->c_box.inner_cols);
             else
