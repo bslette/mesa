@@ -6,6 +6,7 @@ use crate::opt_instr_sched_common::*;
 use crate::reg_tracker::RegRefIterable;
 use crate::reg_tracker::RegTracker;
 use std::cmp::max;
+use std::cmp::min;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -158,8 +159,18 @@ fn new_future_ready_instr<E>(
     }
 }
 
+/// Cycles between global loads.  Issued back to back, a few dozen of them
+/// fill the memory queue, and the shared memory loads (LDSM) that the next
+/// MMAs need wait behind them.
+const GLOBAL_LOAD_SPACING: u32 = 8;
+
+fn is_global_load(op: &Op) -> bool {
+    matches!(op, Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)))
+}
+
 fn generate_order(
     g: &mut DepGraph,
+    instrs: &[Instr],
     init_ready_list: Vec<usize>,
 ) -> (Vec<usize>, u64) {
     let mut ready_instrs: BinaryHeap<ReadyInstr> = BinaryHeap::new();
@@ -169,6 +180,8 @@ fn generate_order(
         .collect();
 
     let mut current_cycle = 0u32;
+    // The first cycle another global load may go
+    let mut global_load_free = 0u32;
     let mut instr_order = Vec::with_capacity(g.nodes.len());
     loop {
         // Move ready instructions to the ready list
@@ -183,8 +196,29 @@ fn generate_order(
             future_ready_instrs.pop();
         }
 
-        // Pick a ready instruction
-        let next_idx = match ready_instrs.pop() {
+        // Pick a ready instruction.  Global loads wait for their spacing
+        // if anything else is ready.
+        let mut held = Vec::new();
+        if current_cycle < global_load_free {
+            while let Some(ri) = ready_instrs.peek() {
+                if !is_global_load(&instrs[ri.index].op) {
+                    break;
+                }
+                held.push(ready_instrs.pop().unwrap());
+            }
+            if ready_instrs.is_empty() && !held.is_empty() {
+                // Only global loads are ready: let time pass
+                current_cycle =
+                    future_ready_instrs.peek().map_or(global_load_free, |f| {
+                        min(f.ready_cycle.0, global_load_free)
+                    });
+                ready_instrs.extend(held);
+                continue;
+            }
+        }
+        let picked = ready_instrs.pop();
+        ready_instrs.extend(held);
+        let next_idx = match picked {
             None => match future_ready_instrs.peek() {
                 None => break, // Both lists are empty. We're done!
                 Some(&FutureReadyInstr {
@@ -202,6 +236,9 @@ fn generate_order(
 
         // Schedule the instuction
         instr_order.push(next_idx);
+        if is_global_load(&instrs[next_idx].op) {
+            global_load_free = current_cycle + GLOBAL_LOAD_SPACING;
+        }
         current_cycle += g.nodes[next_idx].label.exec_latency;
 
         let outgoing_edges =
@@ -229,7 +266,8 @@ fn sched_buffer(
     let init_ready_list = calc_statistics(&mut g);
     // save_graphviz(&instrs, &g).unwrap();
     g.reverse();
-    let (new_order, cycle_count) = generate_order(&mut g, init_ready_list);
+    let (new_order, cycle_count) =
+        generate_order(&mut g, &instrs, init_ready_list);
 
     // Apply the new instruction order
     let mut instrs: Vec<Option<Instr>> = instrs.into_iter().map(Some).collect();

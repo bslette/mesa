@@ -1520,6 +1520,68 @@ nak_nir_lower_load_store(nir_shader *nir, const struct nak_compiler *nak)
    return progress;
 }
 
+/* The leaves of a tree of 64-bit iadds, at most max_leaves of them */
+static bool
+collect_iadd_leaves(nir_def *def, nir_def **leaves, unsigned *num,
+                    unsigned max_leaves, unsigned depth)
+{
+   nir_alu_instr *alu = nir_def_as_alu_or_null(def);
+   if (depth < 10 && alu && alu->op == nir_op_iadd &&
+       alu->def.num_components == 1 &&
+       alu->src[0].swizzle[0] == 0 && alu->src[1].swizzle[0] == 0) {
+      return collect_iadd_leaves(alu->src[0].src.ssa, leaves, num,
+                                 max_leaves, depth + 1) &&
+             collect_iadd_leaves(alu->src[1].src.ssa, leaves, num,
+                                 max_leaves, depth + 1);
+   }
+   if (*num == max_leaves)
+      return false;
+   leaves[(*num)++] = def;
+   return true;
+}
+
+/* An address like (base + uniform) + index, with the uniform part inside:
+ * add up the divergent and the uniform leaves separately, so that the
+ * uniform sum goes in the uniform address and the divergent one, often the
+ * same for several accesses, can be shared.  64-bit adds wrap, so any
+ * order gives the same address.
+ *
+ * The decode functions of coopmat2 tensor loads address each row of a
+ * tile as base + row offset + index, with a uniform row offset: q4_K loads
+ * then took four 64-bit address instructions each, and now share one
+ * address.
+ */
+static bool
+split_uniform_address_tree(nir_builder *b, nir_intrinsic_instr *intr,
+                           nir_src *offset_src, nir_src *uniform_offset_src,
+                           nir_block *use_block)
+{
+   nir_def *leaves[16];
+   unsigned num = 0;
+   if (offset_src->ssa->bit_size != 64 ||
+       !collect_iadd_leaves(offset_src->ssa, leaves, &num, 16, 0))
+      return false;
+
+   nir_def *addr = NULL, *uaddr = NULL;
+   b->cursor = nir_before_instr(&intr->instr);
+   for (unsigned i = 0; i < num; i++) {
+      if (nir_def_is_divergent_at_use_block(leaves[i], use_block)) {
+         addr = addr ? nir_iadd(b, addr, leaves[i]) : leaves[i];
+      } else if (uaddr) {
+         uaddr = nir_iadd(b, uaddr, leaves[i]);
+         uaddr->divergent = false;
+      } else {
+         uaddr = leaves[i];
+      }
+   }
+   if (!addr || !uaddr)
+      return false;
+
+   nir_src_rewrite(offset_src, addr);
+   nir_src_rewrite(uniform_offset_src, uaddr);
+   return true;
+}
+
 static bool
 nak_nir_opt_uniform_address_impl(struct nir_builder *b,
                                  nir_intrinsic_instr *intr, void *cb_data)
@@ -1565,8 +1627,10 @@ nak_nir_opt_uniform_address_impl(struct nir_builder *b,
 
       unsigned src0_div = nir_def_is_divergent_at_use_block(iadd->src[0].src.ssa, use_block);
       unsigned src1_div = nir_def_is_divergent_at_use_block(iadd->src[1].src.ssa, use_block);
-      if (src0_div && src1_div)
-         return false;
+      if (src0_div && src1_div) {
+         return split_uniform_address_tree(b, intr, offset_src,
+                                           uniform_offset_src, use_block);
+      }
 
       b->cursor = nir_before_instr(&intr->instr);
 
