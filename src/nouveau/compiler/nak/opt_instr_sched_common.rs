@@ -81,6 +81,55 @@ pub enum SideEffect {
     Barrier,
 }
 
+/// Whether op is a workgroup barrier.  These only order memory: the
+/// schedulers keep them in order with memory ops, but let instructions that
+/// only touch registers move across them.  In matrix multiply loops that
+/// lets the last MMAs of a step overlap with the barrier and the shared
+/// memory stores of the next one.
+pub fn is_workgroup_barrier(op: &Op) -> bool {
+    matches!(op, Op::Bar(_))
+}
+
+/// Whether op only reads memory, so that it may be reordered with other
+/// such loads.  Strong loads stay in order, for coherence.
+fn is_reorderable_load(op: &Op) -> bool {
+    match op {
+        Op::Ld(ld) => !matches!(ld.access.order, MemOrder::Strong(_)),
+        Op::Ldsm(_) => true,
+        _ => false,
+    }
+}
+
+/// The order memory side effects have to keep within a block: loads stay
+/// on their side of anything that writes memory (or might, like barriers
+/// and fences), but not in order among themselves.  Ops are added in the
+/// order the scheduler walks the block, forwards or backwards.
+#[derive(Default)]
+pub struct MemDeps {
+    last_write: Option<usize>,
+    loads_since_write: Vec<usize>,
+}
+
+impl MemDeps {
+    /// Adds memory op ip and returns the ops added before that it has to
+    /// stay ordered with
+    pub fn add(&mut self, ip: usize, op: &Op) -> Vec<usize> {
+        let mut deps: Vec<usize> = self.last_write.into_iter().collect();
+        if is_reorderable_load(op) {
+            self.loads_since_write.push(ip);
+        } else {
+            deps.append(&mut self.loads_since_write);
+            self.last_write = Some(ip);
+        }
+        deps
+    }
+
+    pub fn clear(&mut self) {
+        self.last_write = None;
+        self.loads_since_write.clear();
+    }
+}
+
 pub fn side_effect_type(op: &Op) -> SideEffect {
     match op {
         // Float ALU
@@ -304,8 +353,12 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
 
         // Global loads go to L2 or memory: the L1 latency below is far too
         // short for them, and schedules their address math and the loads
-        // too close to the instructions that wait on them.
-        Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)) => 200,
+        // too close to the instructions that wait on them.  Under load, with
+        // the memory queue full, they take far longer than an idle round
+        // trip, so this is deliberately high: it starts them as early as
+        // the block allows, which in matrix multiply loops is what hides
+        // the next tile's loads behind the current tile's MMAs.
+        Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)) => 3000,
 
         Op::Ld(_)
         | Op::Ldsm(_)

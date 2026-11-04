@@ -5,8 +5,9 @@ use crate::api::{GetDebugFlags, DEBUG};
 use crate::ir::*;
 use crate::liveness::{BlockLiveness, LiveSet, Liveness, SimpleLiveness};
 use crate::opt_instr_sched_common::{
-    calc_statistics, estimate_variable_latency, side_effect_type, DepGraph,
-    EdgeLabel, FutureReadyInstr, ReadyInstr, SideEffect,
+    calc_statistics, estimate_variable_latency, is_workgroup_barrier,
+    side_effect_type, DepGraph, EdgeLabel, FutureReadyInstr, MemDeps,
+    ReadyInstr, SideEffect,
 };
 use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
@@ -21,6 +22,10 @@ const SW_RESERVED_GPRS_SPILL: i32 = 2;
 /// Target number of free GPRs. This is used for the threshold to switch to
 /// scheduling for register pressure
 const TARGET_FREE: i32 = 4;
+
+/// How many cycles before the end of a block a global load whose result is
+/// only used after the block is issued
+const LIVE_OUT_GLOBAL_LOAD_CYCLES: u32 = 600;
 
 /// Typically using an extra register is free... until you hit a threshold where
 /// one more register causes occupancy to plummet. This function figures out how
@@ -70,7 +75,7 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
 
     let mut defs = FxHashMap::<SSAValue, (usize, usize)>::default();
 
-    let mut last_memory_op = None;
+    let mut mem_deps = MemDeps::default();
     let mut last_barrier_op = None;
     let mut last_carry_op = None;
 
@@ -83,18 +88,18 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
 
         match side_effect_type(&instr.op) {
             SideEffect::None => (),
-            SideEffect::Barrier => {
+            SideEffect::Barrier if !is_workgroup_barrier(&instr.op) => {
                 let first_ip = last_barrier_op.unwrap_or(0);
                 for other_ip in first_ip..ip {
                     g.add_edge(other_ip, ip, EdgeLabel { latency: 0 });
                 }
                 last_barrier_op = Some(ip);
+                mem_deps.clear();
             }
-            SideEffect::Memory => {
-                if let Some(mem_ip) = last_memory_op {
+            SideEffect::Barrier | SideEffect::Memory => {
+                for mem_ip in mem_deps.add(ip, &instr.op) {
                     g.add_edge(mem_ip, ip, EdgeLabel { latency: 0 });
                 }
-                last_memory_op = Some(ip);
             }
         }
 
@@ -453,11 +458,30 @@ impl<'a> GenerateOrder<'a> {
         init_ready_list: &[usize],
         thresholds: ScheduleThresholds,
     ) -> Option<(Vec<usize>, PerRegFile<i32>)> {
-        let mut ready_instrs: BTreeSet<ReadyInstr> = init_ready_list
-            .iter()
-            .map(|&i| ReadyInstr::new(g, i))
-            .collect();
+        let mut ready_instrs: BTreeSet<ReadyInstr> = BTreeSet::new();
         let mut future_ready_instrs = BTreeSet::new();
+
+        // A global load whose result is only used after the block (the
+        // next tile of a loop, say) is still waited on soon after it, so
+        // issue it some time before the end of the block rather than last.
+        for &i in init_ready_list {
+            let instr = &self.instrs[i];
+            let is_global_ld = matches!(&instr.op,
+                Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)));
+            let live_out = instr
+                .dsts()
+                .iter()
+                .flat_map(|d| d.iter_ssa())
+                .any(|ssa| self.live.contains(ssa));
+            if is_global_ld && live_out {
+                future_ready_instrs.insert(FutureReadyInstr {
+                    ready_cycle: Reverse(LIVE_OUT_GLOBAL_LOAD_CYCLES),
+                    index: i,
+                });
+            } else {
+                ready_instrs.insert(ReadyInstr::new(g, i));
+            }
+        }
 
         struct InstrInfo {
             num_uses: u32,
