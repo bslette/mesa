@@ -280,16 +280,34 @@ fn is_long_latency(op: &Op) -> bool {
     }
 }
 
+/// How long a scoreboard dependency takes to clear
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BarClass {
+    /// Everything that doesn't go to memory
+    Quick,
+    /// The sources of a memory op: read when the op leaves the memory
+    /// queue, which is neither quick nor a round trip to memory
+    MemRead,
+    /// The results of a memory op
+    MemResult,
+}
+
+impl BarClass {
+    fn is_mem(self) -> bool {
+        self != BarClass::Quick
+    }
+}
+
 /// Scoreboard barriers.  A barrier counts all the instructions signaling it,
 /// so several dependencies can share one: waiting on any of them then waits
-/// on all of them.  Only dependencies with similar latencies share, so that
+/// on all of them.  Only dependencies of the same class share, so that
 /// waiting on a quick one doesn't mean waiting for memory.
 struct BarAlloc {
     num_bars: u8,
     bar_deps: [Vec<usize>; 6],
     /// The earliest first wait of a dependency on each barrier
     bar_wait: [(usize, usize); 6],
-    bar_long: [bool; 6],
+    bar_class: [BarClass; 6],
 }
 
 impl BarAlloc {
@@ -298,7 +316,7 @@ impl BarAlloc {
             num_bars: 6,
             bar_deps: Default::default(),
             bar_wait: [(usize::MAX, usize::MAX); 6],
-            bar_long: [false; 6],
+            bar_class: [BarClass::Quick; 6],
         }
     }
 
@@ -312,13 +330,15 @@ impl BarAlloc {
         bar: u8,
         dep: usize,
         wait: (usize, usize),
-        long: bool,
+        class: BarClass,
     ) {
         let b = usize::from(bar);
-        debug_assert!(self.bar_deps[b].is_empty() || self.bar_long[b] == long);
+        debug_assert!(
+            self.bar_deps[b].is_empty() || self.bar_class[b] == class
+        );
         self.bar_deps[b].push(dep);
         self.bar_wait[b] = min(self.bar_wait[b], wait);
-        self.bar_long[b] = long;
+        self.bar_class[b] = class;
     }
 
     pub fn free_bar(&mut self, bar: u8) {
@@ -339,9 +359,11 @@ impl BarAlloc {
         bar
     }
 
-    pub fn num_long_bars(&self) -> u8 {
+    pub fn num_mem_bars(&self) -> u8 {
         (0..self.num_bars)
-            .filter(|&b| !self.bar_is_free(b) && self.bar_long[usize::from(b)])
+            .filter(|&b| {
+                !self.bar_is_free(b) && self.bar_class[usize::from(b)].is_mem()
+            })
             .count()
             .try_into()
             .unwrap()
@@ -358,12 +380,13 @@ impl BarAlloc {
     pub fn pick_shared_bar_except(
         &self,
         wait: (usize, usize),
-        long: bool,
+        class: BarClass,
         except: Option<u8>,
     ) -> Option<u8> {
         let mut best: Option<u8> = None;
         for bar in 0..self.num_bars {
-            if Some(bar) == except || self.bar_long[usize::from(bar)] != long {
+            if Some(bar) == except || self.bar_class[usize::from(bar)] != class
+            {
                 continue;
             }
             let bw = self.bar_wait[usize::from(bar)];
@@ -807,6 +830,19 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
             let long = is_long_latency(&instr.op);
             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
             for (dep, is_wr) in [(rd_dep, false), (wr_dep, true)] {
+                // A memory op's sources are read long before its results
+                // come back, and in matrix multiply loops the reads are
+                // waited on (the next load reuses the address registers)
+                // while the results are still in flight.  Sharing a barrier
+                // with results would make those waits take a whole trip to
+                // memory.
+                let class = if !long {
+                    BarClass::Quick
+                } else if is_wr {
+                    BarClass::MemResult
+                } else {
+                    BarClass::MemRead
+                };
                 if !deps.dep_is_waited_after(dep, bi, ip) {
                     continue;
                 }
@@ -814,20 +850,24 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
                 let except = if is_wr { instr.deps.rd_bar() } else { None };
                 // Memory operations keep at least half the barriers free
                 // for everything else.
-                let free = if long && bars.num_long_bars() >= bars.num_bars / 2 {
+                let free = if class.is_mem()
+                    && bars.num_mem_bars() >= bars.num_bars / 2
+                {
                     None
                 } else {
                     bars.try_find_free_bar()
                 };
                 let bar = free
-                    .or_else(|| bars.pick_shared_bar_except(wait, long, except))
+                    .or_else(|| {
+                        bars.pick_shared_bar_except(wait, class, except)
+                    })
                     .or_else(|| bars.try_find_free_bar())
                     .unwrap_or_else(|| {
                         let bar = bars.free_some_bar(except);
                         instr.deps.add_wt_bar(bar);
                         bar
                     });
-                bars.add_bar_dep(bar, dep, wait, long);
+                bars.add_bar_dep(bar, dep, wait, class);
                 if is_wr {
                     instr.deps.set_wr_bar(bar);
                 } else {
