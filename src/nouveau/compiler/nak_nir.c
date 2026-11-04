@@ -848,11 +848,22 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
        * before we kick off the next load.  Otherwise, if one load happens to
        * be faster than the other (they are variable latency, after all) we're
        * still guaranteed that the loads happen in the order we want.
+       *
+       * SV_CLOCK is the SM's own cycle counter.  For the device clock
+       * (shaderDeviceClock), which has to be comparable across the whole
+       * device, read the global timer (nanoseconds) instead.
        */
+      const bool device = nak->sm >= 70 &&
+                          nir_intrinsic_memory_scope(intrin) == SCOPE_DEVICE;
+      const enum nak_sv lo_idx = device ? NAK_SV_GLOBAL_TIMER_LO
+                                        : NAK_SV_CLOCK_LO;
+      const enum nak_sv hi_idx = device ? NAK_SV_GLOBAL_TIMER_HI
+                                        : NAK_SV_CLOCK_HI;
+
       nir_variable *clock =
          nir_local_variable_create(b->impl, glsl_uvec2_type(), NULL);
 
-      nir_def *clock_hi = nak_nir_load_sysval(b, NAK_SV_CLOCK_HI, 0);
+      nir_def *clock_hi = nak_nir_load_sysval(b, hi_idx, 0);
       nir_ssa_bar_nv(b, clock_hi);
 
       nir_store_var(b, clock, nir_vec2(b, nir_imm_int(b, 0), clock_hi), 0x3);
@@ -861,10 +872,10 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       {
          nir_def *last_clock = nir_load_var(b, clock);
 
-         nir_def *clock_lo = nak_nir_load_sysval(b, NAK_SV_CLOCK_LO, 0);
+         nir_def *clock_lo = nak_nir_load_sysval(b, lo_idx, 0);
          nir_ssa_bar_nv(b, clock_lo);
 
-         clock_hi = nak_nir_load_sysval(b, NAK_SV_CLOCK + 1, 0);
+         clock_hi = nak_nir_load_sysval(b, hi_idx, 0);
          nir_ssa_bar_nv(b, clock_hi);
 
          nir_store_var(b, clock, nir_vec2(b, clock_lo, clock_hi), 0x3);
